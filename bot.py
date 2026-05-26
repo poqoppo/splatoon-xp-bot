@@ -2,17 +2,14 @@ import discord
 import sqlite3
 import re
 import os
+import urllib.request
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import math
 from collections import Counter
 from flask import Flask
 from threading import Thread
-
-# --- ここを追加：日本語フォントの設定 ---
-plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.sans-serif'] = ['DejaVu Sans'] # これで日本語なしでもエラーを防ぐ
-# ----------------------------------
 
 # Flaskサーバー用 (Render対策)
 app = Flask('')
@@ -23,6 +20,17 @@ def run():
     app.run(host='0.0.0.0', port=10000)
 t = Thread(target=run)
 t.start()
+
+# 日本語フォントの設定
+def setup_font():
+    font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Regular.ttc"
+    font_path = "NotoSansCJK.ttc"
+    if not os.path.exists(font_path):
+        urllib.request.urlretrieve(font_url, font_path)
+    fm.fontManager.addfont(font_path)
+    plt.rcParams['font.family'] = 'Noto Sans CJK JP'
+
+setup_font()
 
 # 設定
 TOKEN = os.environ.get('DISCORD_TOKEN')
@@ -95,8 +103,8 @@ async def on_message(message):
                 xps.append(cxp)
             plt.plot(d_times, xps, marker='o', label=uname)
         conn.close()
-        plt.title(f'みんなの成長記録（{title}）'); plt.xticks(rotation=90); plt.legend(); plt.tight_layout()
-        plt.savefig('all.png'); plt.close(); await message.channel.send(file=discord.File('all.png'))
+        plt.title(f'みんなの成長記録（{title}）'); plt.grid(True, linestyle='--', alpha=0.7); plt.xticks(rotation=90); plt.legend(); plt.tight_layout()
+        plt.savefig('all.png'); plt.close(); import time; time.sleep(1); await message.channel.send(file=discord.File('all.png'))
 
     elif message.content.startswith('!グラフ'):
         ty, ts, ia, title = parse_args(message.content, current_year, current_season)
@@ -105,8 +113,10 @@ async def on_message(message):
         rec = cursor.fetchall(); conn.close()
         if not rec: await message.channel.send('データがありません'); return
         times = [f"{t[0][2:4]}年{int(t[0][5:7])}月{int(t[0][8:10])}日" for t in rec]
-        plt.figure(figsize=(10, 5)); plt.plot(times, [r[1] for r in rec], marker='o'); plt.xticks(rotation=90); plt.tight_layout()
-        plt.savefig('g.png'); plt.close(); await message.channel.send(file=discord.File('g.png'))
+        plt.figure(figsize=(10, 5)); plt.plot(times, [r[1] for r in rec], marker='o')
+        plt.title(f'{message.author.display_name} さんの成長記録 ({title})', fontsize=16)
+        plt.grid(True, linestyle='--', alpha=0.7); plt.xticks(rotation=90); plt.tight_layout()
+        plt.savefig('g.png'); plt.close(); import time; time.sleep(1); await message.channel.send(file=discord.File('g.png'))
 
     elif message.content.startswith('!ランキング'):
         ty, ts, ia, title = parse_args(message.content, current_year, current_season)
