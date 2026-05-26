@@ -4,11 +4,15 @@ import re
 import os
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-import japanize_matplotlib
 import math
 from collections import Counter
 from flask import Flask
 from threading import Thread
+
+# --- ここを追加：日本語フォントの設定 ---
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans'] # これで日本語なしでもエラーを防ぐ
+# ----------------------------------
 
 # Flaskサーバー用 (Render対策)
 app = Flask('')
