@@ -34,7 +34,7 @@ setup_font()
 
 # ==================== 【設定部分】 ====================
 TOKEN = os.environ.get('DISCORD_TOKEN')
-TARGET_CHANNEL_ID = 1474973509217423401  # ★XP報告するチャンネルID
+TARGET_CHANNEL_ID =  1474973509217423401 # ★XP報告するチャンネルID
 LOG_CHANNEL_ID = 1508739566138294522    # ★バックアップ用チャンネルID
 # ====================================================
 
@@ -45,36 +45,57 @@ client = discord.Client(intents=intents)
 # 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
+# 引数解析を「月指定」に対応拡張
 def parse_args(content, current_year, current_season_type):
-    if "全期間" in content: return str(current_year), current_season_type, True, "全期間"
+    if "全期間" in content: 
+        return str(current_year), current_season_type, None, True, "全期間"
+        
     target_year = str(current_year)
     year_match = re.search(r'([0-9]{4})年', content)
-    if year_match: target_year = year_match.group(1)
+    if year_match: 
+        target_year = year_match.group(1)
+        
+    # 「〇月」の指定があるかチェック
+    month_match = re.search(r'([0-9]{1,2})月', content)
+    if month_match:
+        target_month = int(month_match.group(1))
+        return target_year, None, target_month, False, f"{target_year}年 {target_month}月"
+        
     target_season = current_season_type
     for s in ["春シーズン", "夏シーズン", "秋シーズン", "冬シーズン", "春", "夏", "秋", "冬"]:
         if s in content:
             target_season = s if "シーズン" in s else f"{s}シーズン"
             break
-    return target_year, target_season, False, f"{target_year}年 {target_season}"
+    return target_year, target_season, None, False, f"{target_year}年 {target_season}"
 
-# ★シーズンの「端っこ（開始日と終了日）」を計算するヘルパー関数
-def get_season_bounds(year_str, season_str):
+# ★グラフの「端っこ（表示期間）」を計算する関数（月指定にも対応）
+def get_graph_bounds(year_str, season_str, month_int):
     y = int(year_str)
-    if "春" in season_str:
-        start = datetime(y, 3, 1, 0, 0, tzinfo=JST)
-        end = datetime(y, 6, 1, 0, 0, tzinfo=JST)
-    elif "夏" in season_str:
-        start = datetime(y, 6, 1, 0, 0, tzinfo=JST)
-        end = datetime(y, 9, 1, 0, 0, tzinfo=JST)
-    elif "秋" in season_str:
-        start = datetime(y, 9, 1, 0, 0, tzinfo=JST)
-        end = datetime(y, 12, 1, 0, 0, tzinfo=JST)
-    elif "冬" in season_str:
-        start = datetime(y, 12, 1, 0, 0, tzinfo=JST)
-        end = datetime(y + 1, 3, 1, 0, 0, tzinfo=JST) # 冬は翌年の3月1日まで
-    else:
-        return None, None
-    return start, end
+    # 月指定の場合：その月の1日から、翌月の1日までの1ヶ月枠
+    if month_int:
+        start = datetime(y, month_int, 1, 0, 0, tzinfo=JST)
+        if month_int == 12:
+            end = datetime(y + 1, 1, 1, 0, 0, tzinfo=JST)
+        else:
+            end = datetime(y, month_int + 1, 1, 0, 0, tzinfo=JST)
+        return start, end
+    
+    # シーズン指定の場合：3ヶ月枠
+    if season_str:
+        if "春" in season_str:
+            start = datetime(y, 3, 1, 0, 0, tzinfo=JST)
+            end = datetime(y, 6, 1, 0, 0, tzinfo=JST)
+        elif "夏" in season_str:
+            start = datetime(y, 6, 1, 0, 0, tzinfo=JST)
+            end = datetime(y, 9, 1, 0, 0, tzinfo=JST)
+        elif "秋" in season_str:
+            start = datetime(y, 9, 1, 0, 0, tzinfo=JST)
+            end = datetime(y, 12, 1, 0, 0, tzinfo=JST)
+        elif "冬" in season_str:
+            start = datetime(y, 12, 1, 0, 0, tzinfo=JST)
+            end = datetime(y + 1, 3, 1, 0, 0, tzinfo=JST)
+        return start, end
+    return None, None
 
 async def get_all_records():
     channel = client.get_channel(LOG_CHANNEL_ID)
@@ -102,7 +123,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} がシーズン境界モードで起動しました！')
+    print(f'{client.user} が月指定モードで起動しました！')
 
 @client.event
 async def on_message(message):
@@ -132,22 +153,26 @@ async def on_message(message):
 
         # 個人グラフ
         elif message.content.startswith('!グラフ'):
-            ty, ts, ia, title = parse_args(message.content, now.year, current_season_type)
+            ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
             if message.author.id not in all_d:
                 await message.channel.send("⚠️ データがありません。"); return
             
             recs = all_d[message.author.id]['records']
-            if not ia: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+            if not ia:
+                if tm: # 月指定フィルター
+                    recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
+                else: # シーズン指定フィルター
+                    recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+            
             if not recs:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
             
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', color='#1f77b4', linewidth=2, markersize=6)
             
-            # ✅ シーズン指定の場合、グラフの表示範囲（端っこ）を完全に固定
             if not ia:
-                start_bounds, end_bounds = get_season_bounds(ty, ts)
+                start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
                 if start_bounds and end_bounds:
                     ax.set_xlim(start_bounds, end_bounds)
 
@@ -162,14 +187,18 @@ async def on_message(message):
 
         # 全員のグラフ
         elif message.content.startswith('!全員のグラフ'):
-            ty, ts, ia, title = parse_args(message.content, now.year, current_season_type)
+            ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
             fig, ax = plt.subplots(figsize=(10, 5))
             has_data = False
             
             for uid, info in all_d.items():
                 recs = info['records']
-                if not ia: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+                if not ia:
+                    if tm:
+                        recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
+                    else:
+                        recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
                 if recs:
                     has_data = True
                     ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', markersize=4, label=info['name'])
@@ -177,9 +206,8 @@ async def on_message(message):
             if not has_data:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
             
-            # ✅ 全員のグラフでも端っこを固定
             if not ia:
-                start_bounds, end_bounds = get_season_bounds(ty, ts)
+                start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
                 if start_bounds and end_bounds:
                     ax.set_xlim(start_bounds, end_bounds)
 
@@ -195,12 +223,16 @@ async def on_message(message):
 
         # ランキング
         elif message.content.startswith('!ランキング'):
-            ty, ts, ia, title = parse_args(message.content, now.year, current_season_type)
+            ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
             ranking = []
             for uid, info in all_d.items():
                 recs = info['records']
-                if not ia: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+                if not ia:
+                    if tm:
+                        recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
+                    else:
+                        recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
                 if recs: ranking.append((info['name'], recs[-1]['xp']))
             if not ranking:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
