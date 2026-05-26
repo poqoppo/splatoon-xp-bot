@@ -3,10 +3,11 @@ import sqlite3
 import re
 import os
 import urllib.request
+import time
+import math
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
-import math
 from collections import Counter
 from flask import Flask
 from threading import Thread
@@ -104,7 +105,8 @@ async def on_message(message):
             plt.plot(d_times, xps, marker='o', label=uname)
         conn.close()
         plt.title(f'みんなの成長記録（{title}）'); plt.grid(True, linestyle='--', alpha=0.7); plt.xticks(rotation=90); plt.legend(); plt.tight_layout()
-        plt.savefig('all.png'); plt.close(); import time; time.sleep(1); await message.channel.send(file=discord.File('all.png'))
+        filename = f'all_{int(time.time())}.png'
+        plt.savefig(filename); plt.close(); time.sleep(1); await message.channel.send(file=discord.File(filename))
 
     elif message.content.startswith('!グラフ'):
         ty, ts, ia, title = parse_args(message.content, current_year, current_season)
@@ -116,7 +118,8 @@ async def on_message(message):
         plt.figure(figsize=(10, 5)); plt.plot(times, [r[1] for r in rec], marker='o')
         plt.title(f'{message.author.display_name} さんの成長記録 ({title})', fontsize=16)
         plt.grid(True, linestyle='--', alpha=0.7); plt.xticks(rotation=90); plt.tight_layout()
-        plt.savefig('g.png'); plt.close(); import time; time.sleep(1); await message.channel.send(file=discord.File('g.png'))
+        filename = f'graph_{message.author.id}_{int(time.time())}.png'
+        plt.savefig(filename); plt.close(); time.sleep(1); await message.channel.send(file=discord.File(filename))
 
     elif message.content.startswith('!ランキング'):
         ty, ts, ia, title = parse_args(message.content, current_year, current_season)
