@@ -35,14 +35,14 @@ setup_font()
 # ==================== 【設定部分】 ====================
 TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = 1474973509217423401  # ★XP報告するチャンネルID
-LOG_CHANNEL_ID = 1508739566138294522     # ★バックアップ用チャンネルID
+LOG_CHANNEL_ID = 1508739566138294522    # ★バックアップ用チャンネルID
 # ====================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# ★日本時間 (JST) の設定
+# 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
 def parse_args(content, current_year, current_season_type):
@@ -57,6 +57,25 @@ def parse_args(content, current_year, current_season_type):
             break
     return target_year, target_season, False, f"{target_year}年 {target_season}"
 
+# ★シーズンの「端っこ（開始日と終了日）」を計算するヘルパー関数
+def get_season_bounds(year_str, season_str):
+    y = int(year_str)
+    if "春" in season_str:
+        start = datetime(y, 3, 1, 0, 0, tzinfo=JST)
+        end = datetime(y, 6, 1, 0, 0, tzinfo=JST)
+    elif "夏" in season_str:
+        start = datetime(y, 6, 1, 0, 0, tzinfo=JST)
+        end = datetime(y, 9, 1, 0, 0, tzinfo=JST)
+    elif "秋" in season_str:
+        start = datetime(y, 9, 1, 0, 0, tzinfo=JST)
+        end = datetime(y, 12, 1, 0, 0, tzinfo=JST)
+    elif "冬" in season_str:
+        start = datetime(y, 12, 1, 0, 0, tzinfo=JST)
+        end = datetime(y + 1, 3, 1, 0, 0, tzinfo=JST) # 冬は翌年の3月1日まで
+    else:
+        return None, None
+    return start, end
+
 async def get_all_records():
     channel = client.get_channel(LOG_CHANNEL_ID)
     data = {} 
@@ -67,14 +86,10 @@ async def get_all_records():
             if len(p) >= 6:
                 uid, uname, xp, t_str, season, msg_id = int(p[0]), p[1], int(p[2]), p[3], p[4], int(p[5])
                 
-                # 古いデータ(時間入り)と新しいデータ(日付のみ)の両方に対応
-                try: 
-                    dt = datetime.strptime(t_str, '%Y/%m/%d %H:%M').replace(tzinfo=JST)
+                try: dt = datetime.strptime(t_str, '%Y/%m/%d %H:%M').replace(tzinfo=JST)
                 except ValueError:
-                    try:
-                        dt = datetime.strptime(t_str, '%Y/%m/%d').replace(tzinfo=JST)
-                    except ValueError:
-                        dt = datetime.now(JST)
+                    try: dt = datetime.strptime(t_str, '%Y/%m/%d').replace(tzinfo=JST)
+                    except ValueError: dt = datetime.now(JST)
 
                 if uid not in data: data[uid] = {'name': uname, 'records': []}
                 data[uid]['name'] = uname
@@ -87,12 +102,12 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が起動しました！')
+    print(f'{client.user} がシーズン境界モードで起動しました！')
 
 @client.event
 async def on_message(message):
     if message.author == client.user: return
-    now = datetime.now(JST) # 常に日本時間を取得
+    now = datetime.now(JST)
     current_season_type = "春シーズン" if now.month in [3,4,5] else "夏シーズン" if now.month in [6,7,8] else "秋シーズン" if now.month in [9,10,11] else "冬シーズン"
     curr_season_full_str = f"{now.year}年 {current_season_type}"
 
@@ -112,11 +127,10 @@ async def on_message(message):
             
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
-                # 記録フォーマットを 年/月/日 に変更
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d')}|{curr_season_full_str}|{message.id}")
                 await message.channel.send(f"✅ {new_xp} XP を保存しました！")
 
-        # グラフ
+        # 個人グラフ
         elif message.content.startswith('!グラフ'):
             ty, ts, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
@@ -131,7 +145,12 @@ async def on_message(message):
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', color='#1f77b4', linewidth=2, markersize=6)
             
-            # X軸の表示を 月/日 のみに変更
+            # ✅ シーズン指定の場合、グラフの表示範囲（端っこ）を完全に固定
+            if not ia:
+                start_bounds, end_bounds = get_season_bounds(ty, ts)
+                if start_bounds and end_bounds:
+                    ax.set_xlim(start_bounds, end_bounds)
+
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
             plt.xticks(rotation=90, fontsize=10) 
             ax.set_title(f"{message.author.display_name} さんの成長記録 ({title})", fontsize=15)
@@ -158,7 +177,12 @@ async def on_message(message):
             if not has_data:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
             
-            # X軸の表示を 月/日 のみに変更
+            # ✅ 全員のグラフでも端っこを固定
+            if not ia:
+                start_bounds, end_bounds = get_season_bounds(ty, ts)
+                if start_bounds and end_bounds:
+                    ax.set_xlim(start_bounds, end_bounds)
+
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
             plt.xticks(rotation=90, fontsize=10) 
             ax.set_title(f"みんなのXP比較グラフ ({title})", fontsize=15)
