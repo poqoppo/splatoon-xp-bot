@@ -3,7 +3,7 @@ import re
 import os
 import time
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.dates as mdates
@@ -42,6 +42,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# ★日本時間 (JST) の設定
+JST = timezone(timedelta(hours=+9), 'JST')
+
 def parse_args(content, current_year, current_season_type):
     if "全期間" in content: return str(current_year), current_season_type, True, "全期間"
     target_year = str(current_year)
@@ -63,8 +66,16 @@ async def get_all_records():
             p = message.content.split('|')
             if len(p) >= 6:
                 uid, uname, xp, t_str, season, msg_id = int(p[0]), p[1], int(p[2]), p[3], p[4], int(p[5])
-                try: dt = datetime.strptime(t_str, '%Y/%m/%d %H:%M')
-                except: dt = datetime.now()
+                
+                # 古いデータ(時間入り)と新しいデータ(日付のみ)の両方に対応
+                try: 
+                    dt = datetime.strptime(t_str, '%Y/%m/%d %H:%M').replace(tzinfo=JST)
+                except ValueError:
+                    try:
+                        dt = datetime.strptime(t_str, '%Y/%m/%d').replace(tzinfo=JST)
+                    except ValueError:
+                        dt = datetime.now(JST)
+
                 if uid not in data: data[uid] = {'name': uname, 'records': []}
                 data[uid]['name'] = uname
                 data[uid]['records'].append({'xp': xp, 'time': dt, 'season': season, 'msg_id': msg_id})
@@ -81,7 +92,7 @@ async def on_ready():
 @client.event
 async def on_message(message):
     if message.author == client.user: return
-    now = datetime.now()
+    now = datetime.now(JST) # 常に日本時間を取得
     current_season_type = "春シーズン" if now.month in [3,4,5] else "夏シーズン" if now.month in [6,7,8] else "秋シーズン" if now.month in [9,10,11] else "冬シーズン"
     curr_season_full_str = f"{now.year}年 {current_season_type}"
 
@@ -101,7 +112,8 @@ async def on_message(message):
             
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
-                await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
+                # 記録フォーマットを 年/月/日 に変更
+                await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d')}|{curr_season_full_str}|{message.id}")
                 await message.channel.send(f"✅ {new_xp} XP を保存しました！")
 
         # グラフ
@@ -118,7 +130,9 @@ async def on_message(message):
             
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', color='#1f77b4', linewidth=2, markersize=6)
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+            
+            # X軸の表示を 月/日 のみに変更
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
             plt.xticks(rotation=90, fontsize=10) 
             ax.set_title(f"{message.author.display_name} さんの成長記録 ({title})", fontsize=15)
             ax.grid(True, linestyle='--', alpha=0.6)
@@ -144,7 +158,8 @@ async def on_message(message):
             if not has_data:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
             
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+            # X軸の表示を 月/日 のみに変更
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
             plt.xticks(rotation=90, fontsize=10) 
             ax.set_title(f"みんなのXP比較グラフ ({title})", fontsize=15)
             ax.grid(True, linestyle='--', alpha=0.6)
@@ -203,7 +218,7 @@ async def on_message(message):
                     await m_log.delete(); deleted = True; break
             await message.channel.send("🗑️ 直近の記録を1件リセットしました！" if deleted else "⚠️ 削除対象がありません。")
 
-        # 【NEW】自分の全データ削除
+        # マイデータ全削除
         elif message.content == '!マイデータ全削除':
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if not log_channel: return
@@ -215,7 +230,7 @@ async def on_message(message):
                     deleted_count += 1
             await message.channel.send(f"✅ あなたの過去データ {deleted_count} 件をすべて完全に消去しました！")
 
-        # 【NEW】サーバーの全データ強制リセット
+        # 全員のデータ強制リセット
         elif message.content == '!全員のデータ強制リセット':
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if not log_channel: return
