@@ -3,7 +3,7 @@ import re
 import os
 import time
 import math
-import random  # ★ランダムなセリフ生成用に追加
+import random
 from datetime import datetime, timedelta, timezone
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -37,6 +37,7 @@ setup_font()
 TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = 1474973509217423401 # ★XP報告するチャンネルID
 LOG_CHANNEL_ID = 1508739566138294522    # ★バックアップ用チャンネルID
+ADMIN_USERS = ["poqoppo", "ricekei"]    # ★全削除・特定削除ができる管理者リスト
 # ====================================================
 
 intents = discord.Intents.default()
@@ -46,26 +47,28 @@ client = discord.Client(intents=intents)
 # 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
+# 何も指定がない場合は「全期間」をデフォルトにする
 def parse_args(content, current_year, current_season_type):
-    if "全期間" in content: 
-        return str(current_year), current_season_type, None, True, "全期間"
-        
     target_year = str(current_year)
     year_match = re.search(r'([0-9]{4})年', content)
     if year_match: 
         target_year = year_match.group(1)
         
     month_match = re.search(r'([0-9]{1,2})月', content)
+    season_match = None
+    for s in ["春シーズン", "夏シーズン", "秋シーズン", "冬シーズン", "春", "夏", "秋", "冬"]:
+        if s in content:
+            season_match = s if "シーズン" in s else f"{s}シーズン"
+            break
+            
     if month_match:
         target_month = int(month_match.group(1))
         return target_year, None, target_month, False, f"{target_year}年 {target_month}月"
-        
-    target_season = current_season_type
-    for s in ["春シーズン", "夏シーズン", "秋シーズン", "冬シーズン", "春", "夏", "秋", "冬"]:
-        if s in content:
-            target_season = s if "シーズン" in s else f"{s}シーズン"
-            break
-    return target_year, target_season, None, False, f"{target_year}年 {target_season}"
+    elif season_match:
+        return target_year, season_match, None, False, f"{target_year}年 {season_match}"
+    else:
+        # 指定がなければ全期間
+        return target_year, None, None, True, "全期間"
 
 def get_graph_bounds(year_str, season_str, month_int):
     y = int(year_str)
@@ -133,7 +136,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が応援・煽りシステム搭載モードで起動しました！')
+    print(f'{client.user} がデフォルト通し・オプション期間モードで起動しました！')
 
 @client.event
 async def on_message(message):
@@ -151,17 +154,12 @@ async def on_message(message):
                 await message.channel.send("⚠️ パワーは500〜5000で入力してください！"); return
             
             all_d = await get_all_records()
-            
-            # --- 【新機能】ランキング分析用の事前データ作成 ---
             current_season_xps = {}
             for uid, info in all_d.items():
                 s_recs = [r for r in info['records'] if r['season'] == curr_season_full_str]
-                if s_recs:
-                    current_season_xps[uid] = (info['name'], s_recs[-1]['xp'])
+                if s_recs: current_season_xps[uid] = (info['name'], s_recs[-1]['xp'])
             
-            # 更新前の自分のXPを取得
             old_xp = current_season_xps.get(message.author.id, (message.author.display_name, None))[1]
-            # ------------------------------------------------
             
             if message.author.id in all_d and all_d[message.author.id]['records']:
                 last_xp = all_d[message.author.id]['records'][-1]['xp']
@@ -172,34 +170,24 @@ async def on_message(message):
             if log_channel:
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
-                # --- 【新機能】煽り・応援メッセージの自動生成 ---
                 updated_xps = current_season_xps.copy()
                 updated_xps[message.author.id] = (message.author.display_name, new_xp)
+                passed_users, overtaken_users = [], []
                 
-                passed_users = []
-                overtaken_users = []
-                
-                # 誰を抜かしたか、誰に抜かされたかを判定
                 for uid, (name, xp) in current_season_xps.items():
                     if uid == message.author.id: continue
-                    # 抜かした（以前は自分以上、今は自分未満）
                     if (old_xp is not None and xp >= old_xp and new_xp > xp) or (old_xp is None and new_xp > xp):
                         passed_users.append(name)
-                    # 抜かされた（以前は自分未満、今は自分超え）
                     if old_xp is not None and xp < old_xp and new_xp < xp:
                         overtaken_users.append(name)
                 
-                # 最新の暫定順位をソート
                 sorted_ranking = sorted(updated_xps.items(), key=lambda x: x[1][1], reverse=True)
                 my_index = -1
                 for idx, (uid, _) in enumerate(sorted_ranking):
                     if uid == message.author.id:
-                        my_index = idx
-                        break
+                        my_index = idx; break
                 
                 drama_msg = ""
-                
-                # 1. 変動ドラマの判定
                 if passed_users:
                     names_str = "、".join(passed_users)
                     drama_msg += random.choice([
@@ -209,37 +197,45 @@ async def on_message(message):
                 elif overtaken_users:
                     names_str = "、".join(overtaken_users)
                     drama_msg += random.choice([
-                        f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？シェルターで耐えてる場合じゃないですよ！💥",
+                        f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？さっさと取り返しましょう！💥",
                         f"\n📉 **【煽り運転感知】** {names_str}さんにスマートにパスされました。悔しさをバネに次、潜りましょう！"
                     ])
                 
-                # 2. 前後のライバルとの距離判定
                 if my_index == 0:
-                    drama_msg += f"\n👑 **現在トップ独走中！** このままパージして逃げ切りましょう！"
+                    drama_msg += f"\n👑 **現在トップ独走中！** このまま連勝して逃げ切りましょう！"
                     if len(sorted_ranking) > 1:
                         _, (next_name, next_xp) = sorted_ranking[1]
                         drama_msg += f"（2位の{next_name}さんとは **XP {new_xp - next_xp}** 差）"
                 else:
-                    # 1つ上のプレイヤー情報
                     _, (above_name, above_xp) = sorted_ranking[my_index - 1]
                     diff_above = above_xp - new_xp
-                    
                     if diff_above == 0:
                         drama_msg += f"\n🔥 1つ上の{above_name}さんと **完全にXPが並びました！** 次の1勝で一気に引き離そう！"
                     elif diff_above <= 30:
                         drama_msg += random.choice([
                             f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全にメインの射程圏内です！"
+                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
                         ])
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
                 
                 await message.channel.send(f"✅ {new_xp} XP を保存しました！{drama_msg}")
-                # ---------------------------------------------
+
+        # ヘルプメニュー案内 (UX改善)
+        elif message.content == '!':
+            help_embed = discord.Embed(
+                title="🦑 XP記録Bot コマンド案内板 📈",
+                description="パワー報告チャンネルで使える便利な機能一覧です！",
+                color=0x1f77b4
+            )
+            help_embed.add_field(name="`!グラフ`", value="個人の成長グラフを生成します。\n（基本は全記録表示。`5月` や `春シーズン` と追加すると期間を絞れます）", inline=False)
+            help_embed.add_field(name="`!比較グラフ`", value="メンバー全員、または指定した人（@メンション）を重ねて比較します。\n（休んでいる人は横線で延長されます。期間指定も可能）", inline=False)
+            help_embed.add_field(name="`!ランキング`", value="現在のXPランキングを表示します。\n（`5月` 等の指定も可能）", inline=False)
+            help_embed.add_field(name="`!リセット` / `!マイデータ全削除`", value="直近1件の取り消し、または自分の過去データをすべて消去します。", inline=False)
+            await message.channel.send(embed=help_embed)
 
         # 個人グラフ
         elif message.content.startswith('!グラフ'):
-            is_continuous = "通し" in message.content or "やった日から" in message.content
             ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
             if message.author.id not in all_d:
@@ -247,7 +243,8 @@ async def on_message(message):
             
             recs = all_d[message.author.id]['records']
             
-            if not ia and not is_continuous:
+            # 期間指定があればフィルタリング
+            if not ia:
                 if tm: recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
                 else: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
             
@@ -256,22 +253,14 @@ async def on_message(message):
             
             fig, ax = plt.subplots(figsize=(12, 6))
             
-            if is_continuous:
-                indices = list(range(len(recs)))
-                xps = [r['xp'] for r in recs]
-                ax.plot(indices, xps, marker='o', color='#1f77b4', linewidth=1.5, markersize=5)
-                labels = [r['time'].strftime('%m/%d %H:%M') for r in recs]
-                plt.xticks(indices, labels, rotation=90, fontsize=9) 
-                ax.set_title(f"{message.author.display_name} さんの成長記録 (全記録 通し)", fontsize=15)
-            else:
-                ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', color='#1f77b4', linewidth=1.5, markersize=5)
-                if not ia:
-                    start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
-                    if start_bounds and end_bounds: ax.set_xlim(start_bounds, end_bounds)
-
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
-                plt.xticks(rotation=90, fontsize=9) 
-                ax.set_title(f"{message.author.display_name} さんの成長記録 ({title})", fontsize=15)
+            # 個人グラフは常に等間隔(通し)スタイルで縦ズレを防ぐ
+            indices = list(range(len(recs)))
+            xps = [r['xp'] for r in recs]
+            ax.plot(indices, xps, marker='o', color='#1f77b4', linewidth=1.5, markersize=5)
+            
+            labels = [r['time'].strftime('%m/%d %H:%M') for r in recs]
+            plt.xticks(indices, labels, rotation=90, fontsize=9) 
+            ax.set_title(f"{message.author.display_name} さんの成長記録 ({title})", fontsize=15)
             
             ax.grid(True, linestyle='--', alpha=0.6)
             plt.tight_layout()
@@ -282,33 +271,29 @@ async def on_message(message):
         # 比較グラフ（全員・メンション統合版）
         elif message.content.startswith('!比較グラフ') or message.content.startswith('!全員のグラフ'):
             is_all = message.content.startswith('!全員のグラフ') or not message.mentions
-            
             target_ids = []
             if message.mentions:
                 target_ids = list(set([message.author.id] + [user.id for user in message.mentions]))
                 
-            is_continuous = "通し" in message.content or "やった日から" in message.content
             ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
             fig, ax = plt.subplots(figsize=(12, 6))
+            plot_data, max_time = [], None
             
-            plot_data = []
-            max_time = None
-            
-            if is_all:
-                target_ids = list(all_d.keys())
+            if is_all: target_ids = list(all_d.keys())
             
             for uid in target_ids:
                 if uid not in all_d: continue
-                info = all_d[uid]
-                recs = info['records']
-                if not ia and not is_continuous:
+                info = all_d[uid]; recs = info['records']
+                
+                # 期間指定があればフィルタリング
+                if not ia:
                     if tm: recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
                     else: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+                
                 if recs:
                     plot_data.append((info['name'], recs))
-                    if max_time is None or recs[-1]['time'] > max_time:
-                        max_time = recs[-1]['time']
+                    if max_time is None or recs[-1]['time'] > max_time: max_time = recs[-1]['time']
             
             if not plot_data:
                 await message.channel.send(f"⚠️ 比較するデータがありません。"); return
@@ -317,18 +302,19 @@ async def on_message(message):
                 times = [r['time'] for r in recs]
                 xps = [r['xp'] for r in recs]
                 line, = ax.plot(times, xps, marker='o', linewidth=1.5, markersize=4, label=name)
-                
+                # 休んでいる人は横線で延長
                 if max_time and times[-1] < max_time:
                     ax.plot([times[-1], max_time], [xps[-1], xps[-1]], color=line.get_color(), linewidth=1.5, marker='')
 
-            if not ia and not is_continuous:
+            # 期間指定がある場合は枠を固定
+            if not ia:
                 start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
                 if start_bounds and end_bounds: ax.set_xlim(start_bounds, end_bounds)
 
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
             plt.xticks(rotation=90, fontsize=9) 
             graph_title = "みんなのXP比較グラフ" if is_all else "指定メンバーのXP比較グラフ"
-            ax.set_title(f"{graph_title} ({'やった日から全記録' if is_continuous else title})", fontsize=15)
+            ax.set_title(f"{graph_title} ({title})", fontsize=15)
             ax.grid(True, linestyle='--', alpha=0.6)
             ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
             plt.tight_layout()
@@ -399,11 +385,32 @@ async def on_message(message):
                     deleted_count += 1
             await message.channel.send(f"✅ あなたの過去データ {deleted_count} 件をすべて完全に消去しました！")
 
-        # 全員のデータ強制リセット
-        elif message.content == '!全員のデータ強制リセット':
+        # 管理者専用：メンバーデータ削除
+        elif message.content.startswith('!メンバーデータ削除'):
+            if message.author.name not in ADMIN_USERS:
+                await message.channel.send("⚠️ このコマンドは管理者専用です。"); return
+            if not message.mentions:
+                await message.channel.send("⚠️ 削除したいメンバーをメンションで指定してください。（例：`!メンバーデータ削除 @相手`）"); return
+            
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if not log_channel: return
-            await message.channel.send("⚠️ サーバーの全データを初期化しています...（少し時間がかかります）")
+            target_user = message.mentions[0]
+            await message.channel.send(f"🗑️ 管理者権限：{target_user.display_name}さんの全データを削除しています...（少し時間がかかります）")
+            deleted_count = 0
+            async for m_log in log_channel.history(limit=5000):
+                if m_log.author == client.user and m_log.content.startswith(f"{target_user.id}|"):
+                    await m_log.delete()
+                    deleted_count += 1
+            await message.channel.send(f"🚨 {target_user.display_name}さんのデータ {deleted_count} 件をすべて完全に消去しました！")
+
+        # 管理者専用：全員のデータ強制リセット
+        elif message.content == '!全員のデータ強制リセット':
+            if message.author.name not in ADMIN_USERS:
+                await message.channel.send("⚠️ このコマンドは管理者専用です。"); return
+                
+            log_channel = client.get_channel(LOG_CHANNEL_ID)
+            if not log_channel: return
+            await message.channel.send("⚠️ 管理者権限：サーバーの全データを初期化しています...（少し時間がかかります）")
             deleted_count = 0
             async for m_log in log_channel.history(limit=5000):
                 if m_log.author == client.user:
@@ -421,8 +428,7 @@ async def on_raw_message_delete(payload):
         if m_log.author == client.user:
             p = m_log.content.split('|')
             if len(p) >= 6 and str(payload.message_id) == p[5]:
-                await m_log.delete()
-                break
+                await m_log.delete(); break
 
 @client.event
 async def on_raw_message_edit(payload):
@@ -439,10 +445,9 @@ async def on_raw_message_edit(payload):
                 if match:
                     new_xp = int(match.group(1) or match.group(2))
                     if not (500 <= new_xp < 5000): return
-                    
                     p[2] = str(new_xp)
                     await m_log.edit(content="|".join(p))
-                else: 
+                else:
                     await m_log.delete()
                 break
 
