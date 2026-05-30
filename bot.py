@@ -55,70 +55,71 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = XPClient(intents=intents)
 
-# 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
-# ---------------------------------------------------------
-# ★新機能: 実際のXマッチ（ガチエリア）のスケジュールを2つのAPIから取得
-# ---------------------------------------------------------
-def fetch_splatoon_schedule_spla3():
-    req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/1.4'})
-    with urllib.request.urlopen(req) as res:
-        return json.loads(res.read().decode())
+# ★過去のエリアスケジュールを半永久的に記憶しておくためのキャッシュ
+CACHED_AREA_SHIFTS = set()
 
-def fetch_splatoon_schedule_ink():
-    req = urllib.request.Request("https://splatoon3.ink/data/schedules.json", headers={'User-Agent': 'XP-Bot/1.4'})
-    with urllib.request.urlopen(req) as res:
-        return json.loads(res.read().decode())
-
+# ---------------------------------------------------------
+# ★新機能: 実際のXマッチ（ガチエリア）のスケジュールを2つのAPIから取得し記憶する
+# ---------------------------------------------------------
 async def get_real_area_time(now_dt):
-    area_shifts = []
+    global CACHED_AREA_SHIFTS
     
-    # メインAPI: spla3.yuu26.com
+    # ① メインAPI (ブロック回避のため身分証を記載)
     try:
-        data = await asyncio.to_thread(fetch_splatoon_schedule_spla3)
+        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/1.5 (Discord)'})
+        res = await asyncio.to_thread(urllib.request.urlopen, req)
+        data = json.loads(res.read().decode())
         for node in data.get("results", []):
             if node.get("rule", {}).get("key") == "AREA":
                 st = datetime.fromisoformat(node["start_time"])
                 et = datetime.fromisoformat(node["end_time"])
-                # タイムゾーン情報の安全な補正
                 if st.tzinfo is None: st = st.replace(tzinfo=JST)
                 if et.tzinfo is None: et = et.replace(tzinfo=JST)
-                area_shifts.append((st.astimezone(JST), et.astimezone(JST)))
+                CACHED_AREA_SHIFTS.add((st.astimezone(JST), et.astimezone(JST)))
     except Exception as e:
         print(f"Primary API Error: {e}")
         
-    # サブAPI: splatoon3.ink (予備)
-    if not area_shifts:
-        try:
-            data = await asyncio.to_thread(fetch_splatoon_schedule_ink)
-            x_schedules = data.get("data", {}).get("xSchedules", {}).get("nodes", [])
-            for node in x_schedules:
-                if not node or not node.get("startTime"): continue
-                setting = node.get("xMatchSetting")
-                if not setting: continue
-                rule = setting.get("vsRule", {}).get("rule")
-                if rule == "AREA":
-                    st = datetime.strptime(node["startTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
-                    et = datetime.strptime(node["endTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
-                    area_shifts.append((st, et))
-        except Exception as e2:
-            print(f"Secondary API Error: {e2}")
+    # ② サブAPI (メインが落ちていた場合の予備ルート)
+    try:
+        req = urllib.request.Request("https://splatoon3.ink/data/schedules.json", headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        res = await asyncio.to_thread(urllib.request.urlopen, req)
+        data = json.loads(res.read().decode())
+        x_schedules = data.get("data", {}).get("xSchedules", {}).get("nodes", [])
+        for node in x_schedules:
+            if not node or not node.get("startTime"): continue
+            setting = node.get("xMatchSetting")
+            if not setting: continue
+            rule = setting.get("vsRule", {}).get("rule")
+            if rule == "AREA":
+                st = datetime.strptime(node["startTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
+                et = datetime.strptime(node["endTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
+                CACHED_AREA_SHIFTS.add((st, et))
+    except Exception as e2:
+        print(f"Secondary API Error: {e2}")
 
-    if not area_shifts:
-        return None
+    # 記憶(キャッシュ)の中から「現在時刻より前に始まった、最も新しいエリア」の終了時刻を探す
+    if CACHED_AREA_SHIFTS:
+        sorted_shifts = sorted(list(CACHED_AREA_SHIFTS), key=lambda x: x[0])
+        best_et = None
+        for st, et in sorted_shifts:
+            if st <= now_dt:
+                best_et = et
+        if best_et:
+            return best_et
 
-    area_shifts.sort(key=lambda x: x[0])
-    best_et = None
-    
-    # 【最重要ロジック】"エリアが始まった瞬間（st）"以降の入力なら、開催中・開催後を問わず、すべてそのエリアの終了時刻（et）を採用する
-    for st, et in area_shifts:
-        if st <= now_dt:
-            best_et = et
-            
-    if best_et:
-        return best_et
     return None
+
+# 万が一APIが全滅し、かつ再起動直後で記憶が空っぽだった場合の最終防衛線（直近の奇数時間の終了時刻）
+def fallback_odd_hour(dt):
+    h = dt.hour
+    if h % 2 == 0: h -= 1
+    if h < 0:
+        h = 23
+        dt = dt - timedelta(days=1)
+    start_time = datetime(dt.year, dt.month, dt.day, h, 0, tzinfo=JST)
+    return start_time + timedelta(hours=2)
 # ---------------------------------------------------------
 
 def parse_args_from_str(text, current_year, current_season_type):
@@ -186,7 +187,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} がスケジュール完全同期モードで起動しました！')
+    print(f'{client.user} がスケジュール記憶・完全同期モードで起動しました！')
 
 # ==================== スラッシュコマンド群 ====================
 
@@ -435,9 +436,13 @@ async def on_message(message):
             
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
+                
+                # ★修正: 取得したエリアのスケジュールを完璧に適用（記憶機能付き）
                 splat_time = await get_real_area_time(now)
+                
                 if not splat_time:
-                    splat_time = now # API両方死んでいた場合は現在時刻
+                    # APIが全滅で記憶もない場合の最終防衛線（直近の奇数時間の終了時刻に丸める）
+                    splat_time = fallback_odd_hour(now)
                 
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
@@ -485,7 +490,7 @@ async def on_message(message):
                     elif diff_above <= 30:
                         drama_msg += random.choice([
                             f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全にメインの射程圏内です！"
+                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
                         ])
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
