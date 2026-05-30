@@ -3,6 +3,7 @@ import re
 import os
 import time
 import math
+import random  # ★ランダムなセリフ生成用に追加
 from datetime import datetime, timedelta, timezone
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -132,7 +133,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が起動しました（比較グラフ統合版）！')
+    print(f'{client.user} が応援・煽りシステム搭載モードで起動しました！')
 
 @client.event
 async def on_message(message):
@@ -150,6 +151,18 @@ async def on_message(message):
                 await message.channel.send("⚠️ パワーは500〜5000で入力してください！"); return
             
             all_d = await get_all_records()
+            
+            # --- 【新機能】ランキング分析用の事前データ作成 ---
+            current_season_xps = {}
+            for uid, info in all_d.items():
+                s_recs = [r for r in info['records'] if r['season'] == curr_season_full_str]
+                if s_recs:
+                    current_season_xps[uid] = (info['name'], s_recs[-1]['xp'])
+            
+            # 更新前の自分のXPを取得
+            old_xp = current_season_xps.get(message.author.id, (message.author.display_name, None))[1]
+            # ------------------------------------------------
+            
             if message.author.id in all_d and all_d[message.author.id]['records']:
                 last_xp = all_d[message.author.id]['records'][-1]['xp']
                 if abs(new_xp - last_xp) > 500:
@@ -158,7 +171,71 @@ async def on_message(message):
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
-                await message.channel.send(f"✅ {new_xp} XP を保存しました！")
+                
+                # --- 【新機能】煽り・応援メッセージの自動生成 ---
+                updated_xps = current_season_xps.copy()
+                updated_xps[message.author.id] = (message.author.display_name, new_xp)
+                
+                passed_users = []
+                overtaken_users = []
+                
+                # 誰を抜かしたか、誰に抜かされたかを判定
+                for uid, (name, xp) in current_season_xps.items():
+                    if uid == message.author.id: continue
+                    # 抜かした（以前は自分以上、今は自分未満）
+                    if (old_xp is not None and xp >= old_xp and new_xp > xp) or (old_xp is None and new_xp > xp):
+                        passed_users.append(name)
+                    # 抜かされた（以前は自分未満、今は自分超え）
+                    if old_xp is not None and xp < old_xp and new_xp < xp:
+                        overtaken_users.append(name)
+                
+                # 最新の暫定順位をソート
+                sorted_ranking = sorted(updated_xps.items(), key=lambda x: x[1][1], reverse=True)
+                my_index = -1
+                for idx, (uid, _) in enumerate(sorted_ranking):
+                    if uid == message.author.id:
+                        my_index = idx
+                        break
+                
+                drama_msg = ""
+                
+                # 1. 変動ドラマの判定
+                if passed_users:
+                    names_str = "、".join(passed_users)
+                    drama_msg += random.choice([
+                        f"\n⚔️ **【下剋上】** {names_str}さんをブチ抜きました！後ろに気をつけてくださいね〜？😜",
+                        f"\n🔥 **【ジャイアントキリング】** {names_str}さんを抜き去りました！ナイス精神攻撃！"
+                    ])
+                elif overtaken_users:
+                    names_str = "、".join(overtaken_users)
+                    drama_msg += random.choice([
+                        f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？シェルターで耐えてる場合じゃないですよ！💥",
+                        f"\n📉 **【煽り運転感知】** {names_str}さんにスマートにパスされました。悔しさをバネに次、潜りましょう！"
+                    ])
+                
+                # 2. 前後のライバルとの距離判定
+                if my_index == 0:
+                    drama_msg += f"\n👑 **現在トップ独走中！** このままパージして逃げ切りましょう！"
+                    if len(sorted_ranking) > 1:
+                        _, (next_name, next_xp) = sorted_ranking[1]
+                        drama_msg += f"（2位の{next_name}さんとは **XP {new_xp - next_xp}** 差）"
+                else:
+                    # 1つ上のプレイヤー情報
+                    _, (above_name, above_xp) = sorted_ranking[my_index - 1]
+                    diff_above = above_xp - new_xp
+                    
+                    if diff_above == 0:
+                        drama_msg += f"\n🔥 1つ上の{above_name}さんと **完全にXPが並びました！** 次の1勝で一気に引き離そう！"
+                    elif diff_above <= 30:
+                        drama_msg += random.choice([
+                            f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
+                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全にメインの射程圏内です！"
+                        ])
+                    else:
+                        drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
+                
+                await message.channel.send(f"✅ {new_xp} XP を保存しました！{drama_msg}")
+                # ---------------------------------------------
 
         # 個人グラフ
         elif message.content.startswith('!グラフ'):
@@ -218,7 +295,6 @@ async def on_message(message):
             plot_data = []
             max_time = None
             
-            # メンションがなければ全員を対象にする
             if is_all:
                 target_ids = list(all_d.keys())
             
@@ -240,10 +316,8 @@ async def on_message(message):
             for name, recs in plot_data:
                 times = [r['time'] for r in recs]
                 xps = [r['xp'] for r in recs]
-                # ドット付きの折れ線
                 line, = ax.plot(times, xps, marker='o', linewidth=1.5, markersize=4, label=name)
                 
-                # 休んでいる期間（最後の記録〜全体の最新時間）はドット無しの横線で延長
                 if max_time and times[-1] < max_time:
                     ax.plot([times[-1], max_time], [xps[-1], xps[-1]], color=line.get_color(), linewidth=1.5, marker='')
 
