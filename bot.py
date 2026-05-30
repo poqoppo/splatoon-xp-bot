@@ -58,34 +58,28 @@ client = XPClient(intents=intents)
 # 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
-# ─── ★最重要：APIから取得したエリアスケジュールを半永久的に溜めておくためのグローバルキャッシュ ───
+# APIから取得したエリアスケジュールを半永久的に溜めておくためのグローバルキャッシュ
 CACHED_AREA_SHIFTS = set()
 
 async def update_and_get_last_area_time(now_dt):
     global CACHED_AREA_SHIFTS
     try:
-        # スプラ3のスケジュールを提供する安定した国内API
-        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.1'})
+        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.2'})
         res = await asyncio.to_thread(urllib.request.urlopen, req)
         data = json.loads(res.read().decode())
         
-        # 取得できたエリア情報をすべてキャッシュに「都度保存（蓄積）」していく
         for node in data.get("results", []):
             if node.get("rule", {}).get("key") == "AREA":
                 st = datetime.fromisoformat(node["start_time"])
                 et = datetime.fromisoformat(node["end_time"])
                 
-                # タイムゾーンを日本時間に安全に補正
                 if st.tzinfo is None: st = st.replace(tzinfo=JST)
                 if et.tzinfo is None: et = et.replace(tzinfo=JST)
                 
-                # セット構造に保存（重複は自動で弾かれます）
                 CACHED_AREA_SHIFTS.add((st.astimezone(JST), et.astimezone(JST)))
     except Exception as e:
         print(f"API Fetch Error: {e}")
         
-    # 蓄積された過去すべての記憶（キャッシュ）の中から、
-    # 「開催が現在時刻以前に始まっていたもの」の中で、最も新しいエリアの終了時刻を特定する
     best_et = None
     if CACHED_AREA_SHIFTS:
         for st, et in CACHED_AREA_SHIFTS:
@@ -95,7 +89,7 @@ async def update_and_get_last_area_time(now_dt):
                     
     return best_et
 
-# APIが全滅、かつ再起動直後でキャッシュが完全に空だった場合の最終保険（直前の奇数時間に丸める）
+# APIが死んでいる場合の最終保険（直前の奇数時間に丸める）
 def get_last_splat_end_time(dt):
     h = dt.hour
     if h % 2 == 0: h -= 1 
@@ -183,7 +177,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} がスケジュール都度保存・完全同期モードで起動しました！')
+    print(f'{client.user} が起動しました（期間表示カスタム版）！')
 
 # ==================== スラッシュコマンド群 ====================
 
@@ -432,20 +426,17 @@ async def on_message(message):
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
                 
-                # 1. ユーザーが手動で時間を指定した場合はそれを最優先
-                splat_time = parse_specified_time(message.content, now)
+                splat_time = await update_and_get_last_area_time(now)
                 is_manual = True
                 
-                # 2. 指定がない場合、蓄積された履歴データから「直近過去のガチエリアの終了時刻」を安全に引っぱる！
                 if not splat_time:
-                    splat_time = await update_and_get_last_area_time(now)
-                    is_manual = False
+                    splat_time = parse_specified_time(message.content, now)
                 
-                # 3. 再起動直後などで記憶が空の場合は、最終防衛線（直前の奇数時間の終了時刻）を計算
                 if not splat_time:
                     splat_time = get_last_splat_end_time(now)
                     is_manual = False
                 
+                # ログ用データは、これまでのデータ構造と互換性を保つため「終了時刻」で美しく保存
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
                 updated_xps = current_season_xps.copy()
@@ -497,7 +488,9 @@ async def on_message(message):
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
                 
-                notice = f"（記録枠：{splat_time.strftime('%m/%d %H:%M')}）"
+                # ─── ★ここが今回の修正部分：終了時刻から2時間を引いて期間表記（15:00-17:00）を作る ───
+                start_time = splat_time - timedelta(hours=2)
+                notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
                 if not is_manual:
                     notice += "\n💡 ※時間が違った場合は、自分のチャットを編集して『17:00』と書き足せば瞬時に修正されます！"
                 
