@@ -4,7 +4,6 @@ import os
 import time
 import math
 from datetime import datetime, timedelta, timezone
-import matplotlib.subplots # 追加
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.dates as mdates
@@ -217,7 +216,6 @@ async def on_message(message):
             plot_data = []
             max_time = None
             
-            # 各メンバーのデータを抽出＆全体の最新時間を探す
             for uid in target_ids:
                 if uid not in all_d: continue
                 info = all_d[uid]
@@ -233,14 +231,11 @@ async def on_message(message):
             if not plot_data:
                 await message.channel.send(f"⚠️ 指定されたメンバーの {title} のデータがありません。"); return
             
-            # グラフ描画（途切れた人はmax_timeまで横線を引く）
             for name, recs in plot_data:
                 times = [r['time'] for r in recs]
                 xps = [r['xp'] for r in recs]
-                # メインの線（ドットあり）
                 line, = ax.plot(times, xps, marker='o', linewidth=1.5, markersize=4, label=name)
                 
-                # やってない期間は横線で延長（ドットなし）
                 if max_time and times[-1] < max_time:
                     ax.plot([times[-1], max_time], [xps[-1], xps[-1]], color=line.get_color(), linewidth=1.5, marker='')
 
