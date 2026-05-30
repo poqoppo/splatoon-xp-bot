@@ -59,53 +59,66 @@ client = XPClient(intents=intents)
 JST = timezone(timedelta(hours=+9), 'JST')
 
 # ---------------------------------------------------------
-# ★新機能: 実際のXマッチ（ガチエリア）のスケジュールを取得する機能
+# ★新機能: 実際のXマッチ（ガチエリア）のスケジュールを2つのAPIから取得
 # ---------------------------------------------------------
-def fetch_splatoon_schedule():
-    url = "https://splatoon3.ink/data/schedules.json"
-    req = urllib.request.Request(url, headers={'User-Agent': 'XP-Bot/1.2'})
+def fetch_splatoon_schedule_spla3():
+    req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/1.4'})
+    with urllib.request.urlopen(req) as res:
+        return json.loads(res.read().decode())
+
+def fetch_splatoon_schedule_ink():
+    req = urllib.request.Request("https://splatoon3.ink/data/schedules.json", headers={'User-Agent': 'XP-Bot/1.4'})
     with urllib.request.urlopen(req) as res:
         return json.loads(res.read().decode())
 
 async def get_real_area_time(now_dt):
+    area_shifts = []
+    
+    # メインAPI: spla3.yuu26.com
     try:
-        data = await asyncio.to_thread(fetch_splatoon_schedule)
-        x_schedules = data.get("data", {}).get("xSchedules", {}).get("nodes", [])
-        area_shifts = []
-        for node in x_schedules:
-            if not node or not node.get("startTime"): continue
-            
-            # 【修正点】JSONの正しい階層(xMatchSetting)からルールを抽出
-            setting = node.get("xMatchSetting")
-            if not setting: continue # フェス中などで設定が無い枠をスキップ
-            
-            rule = setting.get("vsRule", {}).get("rule")
-            if rule == "AREA": # ガチエリア
-                st = datetime.strptime(node["startTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                et = datetime.strptime(node["endTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                area_shifts.append((st, et))
-        
-        area_shifts.sort(key=lambda x: x[0])
-        best_et = None
-        
-        # 現在時刻以前に始まった最新の「エリア」枠を探す
-        for st, et in area_shifts:
-            if st <= now_dt:
-                best_et = et # 常に最新のエリアの終了時刻に更新されていく
-                
-        if best_et:
-            return best_et.astimezone(JST) # 最も直近のエリアの「終了時刻」を返す
-            
+        data = await asyncio.to_thread(fetch_splatoon_schedule_spla3)
+        for node in data.get("results", []):
+            if node.get("rule", {}).get("key") == "AREA":
+                st = datetime.fromisoformat(node["start_time"])
+                et = datetime.fromisoformat(node["end_time"])
+                # タイムゾーン情報の安全な補正
+                if st.tzinfo is None: st = st.replace(tzinfo=JST)
+                if et.tzinfo is None: et = et.replace(tzinfo=JST)
+                area_shifts.append((st.astimezone(JST), et.astimezone(JST)))
     except Exception as e:
-        print(f"API Fetch Error: {e}")
-    return None
+        print(f"Primary API Error: {e}")
+        
+    # サブAPI: splatoon3.ink (予備)
+    if not area_shifts:
+        try:
+            data = await asyncio.to_thread(fetch_splatoon_schedule_ink)
+            x_schedules = data.get("data", {}).get("xSchedules", {}).get("nodes", [])
+            for node in x_schedules:
+                if not node or not node.get("startTime"): continue
+                setting = node.get("xMatchSetting")
+                if not setting: continue
+                rule = setting.get("vsRule", {}).get("rule")
+                if rule == "AREA":
+                    st = datetime.strptime(node["startTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
+                    et = datetime.strptime(node["endTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
+                    area_shifts.append((st, et))
+        except Exception as e2:
+            print(f"Secondary API Error: {e2}")
 
-# API取得失敗時の保険
-def fallback_splat_time(dt):
-    base_midnight = datetime(dt.year, dt.month, dt.day, 0, 0, tzinfo=JST)
-    seconds_from_midnight = (dt - base_midnight).total_seconds()
-    blocks = round(seconds_from_midnight / 7200)
-    return base_midnight + timedelta(seconds=blocks * 7200)
+    if not area_shifts:
+        return None
+
+    area_shifts.sort(key=lambda x: x[0])
+    best_et = None
+    
+    # 【最重要ロジック】"エリアが始まった瞬間（st）"以降の入力なら、開催中・開催後を問わず、すべてそのエリアの終了時刻（et）を採用する
+    for st, et in area_shifts:
+        if st <= now_dt:
+            best_et = et
+            
+    if best_et:
+        return best_et
+    return None
 # ---------------------------------------------------------
 
 def parse_args_from_str(text, current_year, current_season_type):
@@ -173,7 +186,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} がスケジュール同期修正版で起動しました！')
+    print(f'{client.user} がスケジュール完全同期モードで起動しました！')
 
 # ==================== スラッシュコマンド群 ====================
 
@@ -424,7 +437,7 @@ async def on_message(message):
             if log_channel:
                 splat_time = await get_real_area_time(now)
                 if not splat_time:
-                    splat_time = fallback_splat_time(now)
+                    splat_time = now # API両方死んでいた場合は現在時刻
                 
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
@@ -472,7 +485,7 @@ async def on_message(message):
                     elif diff_above <= 30:
                         drama_msg += random.choice([
                             f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
+                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全にメインの射程圏内です！"
                         ])
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
