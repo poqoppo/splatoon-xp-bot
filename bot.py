@@ -64,7 +64,7 @@ CACHED_AREA_SHIFTS = set()
 async def update_and_get_last_area_time(now_dt):
     global CACHED_AREA_SHIFTS
     try:
-        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.2'})
+        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.4'})
         res = await asyncio.to_thread(urllib.request.urlopen, req)
         data = json.loads(res.read().decode())
         
@@ -177,7 +177,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が起動しました（期間表示カスタム版）！')
+    print(f'{client.user} が起動しました（編集時完了メッセージ通知版）！')
 
 # ==================== スラッシュコマンド群 ====================
 
@@ -436,7 +436,6 @@ async def on_message(message):
                     splat_time = get_last_splat_end_time(now)
                     is_manual = False
                 
-                # ログ用データは、これまでのデータ構造と互換性を保つため「終了時刻」で美しく保存
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
                 updated_xps = current_season_xps.copy()
@@ -483,16 +482,15 @@ async def on_message(message):
                     elif diff_above <= 30:
                         drama_msg += random.choice([
                             f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
+                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全にメインの射程圏内です！"
                         ])
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
                 
-                # ─── ★ここが今回の修正部分：終了時刻から2時間を引いて期間表記（15:00-17:00）を作る ───
                 start_time = splat_time - timedelta(hours=2)
                 notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
                 if not is_manual:
-                    notice += "\n💡 ※時間が違った場合は、自分のチャットを編集して『17:00』と書き足せば瞬時に修正されます！"
+                    notice += "\n💡 ※時間が違った場合は、チャットを編集してエリアの『終了時間（例：17:00）』を書き足してください！"
                 
                 await message.channel.send(f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}")
 
@@ -507,10 +505,12 @@ async def on_raw_message_delete(payload):
             if len(p) >= 6 and str(payload.message_id) == p[5]:
                 await m_log.delete(); break
 
+# 【最重要アップデート】編集完了を画面上に都度通知する機能を追加
 @client.event
 async def on_raw_message_edit(payload):
     if payload.channel_id != TARGET_CHANNEL_ID: return
     log_channel = client.get_channel(LOG_CHANNEL_ID)
+    target_channel = client.get_channel(TARGET_CHANNEL_ID) # ★通知送信用に取得
     content = payload.data.get('content')
     if not log_channel or not content: return
     match = re.search(r'xp\s*([0-9]+)|([0-9]+)\s*xp', content, re.IGNORECASE)
@@ -526,6 +526,13 @@ async def on_raw_message_edit(payload):
                     spec_time = parse_specified_time(content, datetime.now(JST))
                     if spec_time:
                         p[3] = spec_time.strftime('%Y/%m/%d %H:%M')
+                        
+                        # ─── ★新機能: 編集が成功したことをチャット枠に明記する ───
+                        if target_channel:
+                            start_time = spec_time - timedelta(hours=2)
+                            time_range_str = f"{start_time.strftime('%H:%M')}ー{spec_time.strftime('%H:%M')}"
+                            await target_channel.send(f"🔄 記録枠を **{time_range_str}** に変更しました！")
+                        # ──────────────────────────────────────────
                     
                     await m_log.edit(content="|".join(p))
                 else:
