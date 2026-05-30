@@ -132,7 +132,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が起動しました（横線延長対応版）！')
+    print(f'{client.user} が起動しました（比較グラフ統合版）！')
 
 @client.event
 async def on_message(message):
@@ -202,12 +202,14 @@ async def on_message(message):
             fname = f'g_{message.author.id}_{int(time.time())}.png'
             plt.savefig(fname); plt.close(); await message.channel.send(file=discord.File(fname))
 
-        # 比較グラフ（横線延長対応）
-        elif message.content.startswith('!比較グラフ'):
-            if not message.mentions:
-                await message.channel.send("⚠️ 比較したい相手をメンションで指定してください！（例：`!比較グラフ @相手の名前`）"); return
+        # 比較グラフ（全員・メンション統合版）
+        elif message.content.startswith('!比較グラフ') or message.content.startswith('!全員のグラフ'):
+            is_all = message.content.startswith('!全員のグラフ') or not message.mentions
+            
+            target_ids = []
+            if message.mentions:
+                target_ids = list(set([message.author.id] + [user.id for user in message.mentions]))
                 
-            target_ids = list(set([message.author.id] + [user.id for user in message.mentions]))
             is_continuous = "通し" in message.content or "やった日から" in message.content
             ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
@@ -215,6 +217,10 @@ async def on_message(message):
             
             plot_data = []
             max_time = None
+            
+            # メンションがなければ全員を対象にする
+            if is_all:
+                target_ids = list(all_d.keys())
             
             for uid in target_ids:
                 if uid not in all_d: continue
@@ -229,13 +235,15 @@ async def on_message(message):
                         max_time = recs[-1]['time']
             
             if not plot_data:
-                await message.channel.send(f"⚠️ 指定されたメンバーの {title} のデータがありません。"); return
+                await message.channel.send(f"⚠️ 比較するデータがありません。"); return
             
             for name, recs in plot_data:
                 times = [r['time'] for r in recs]
                 xps = [r['xp'] for r in recs]
+                # ドット付きの折れ線
                 line, = ax.plot(times, xps, marker='o', linewidth=1.5, markersize=4, label=name)
                 
+                # 休んでいる期間（最後の記録〜全体の最新時間）はドット無しの横線で延長
                 if max_time and times[-1] < max_time:
                     ax.plot([times[-1], max_time], [xps[-1], xps[-1]], color=line.get_color(), linewidth=1.5, marker='')
 
@@ -245,57 +253,13 @@ async def on_message(message):
 
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
             plt.xticks(rotation=90, fontsize=9) 
-            ax.set_title(f"指定メンバーのXP比較グラフ ({'やった日から全記録' if is_continuous else title})", fontsize=15)
+            graph_title = "みんなのXP比較グラフ" if is_all else "指定メンバーのXP比較グラフ"
+            ax.set_title(f"{graph_title} ({'やった日から全記録' if is_continuous else title})", fontsize=15)
             ax.grid(True, linestyle='--', alpha=0.6)
             ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
             plt.tight_layout()
             
             fname = f'comp_{message.author.id}_{int(time.time())}.png'
-            plt.savefig(fname); plt.close(); await message.channel.send(file=discord.File(fname))
-
-        # 全員のグラフ（横線延長対応）
-        elif message.content.startswith('!全員のグラフ'):
-            is_continuous = "通し" in message.content or "やった日から" in message.content
-            ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
-            all_d = await get_all_records()
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            plot_data = []
-            max_time = None
-            
-            for uid, info in all_d.items():
-                recs = info['records']
-                if not ia and not is_continuous:
-                    if tm: recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
-                    else: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
-                if recs:
-                    plot_data.append((info['name'], recs))
-                    if max_time is None or recs[-1]['time'] > max_time:
-                        max_time = recs[-1]['time']
-            
-            if not plot_data:
-                await message.channel.send(f"⚠️ {title} のデータがありません。"); return
-            
-            for name, recs in plot_data:
-                times = [r['time'] for r in recs]
-                xps = [r['xp'] for r in recs]
-                line, = ax.plot(times, xps, marker='o', linewidth=1.5, markersize=4, label=name)
-                
-                if max_time and times[-1] < max_time:
-                    ax.plot([times[-1], max_time], [xps[-1], xps[-1]], color=line.get_color(), linewidth=1.5, marker='')
-
-            if not ia and not is_continuous:
-                start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
-                if start_bounds and end_bounds: ax.set_xlim(start_bounds, end_bounds)
-
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
-            plt.xticks(rotation=90, fontsize=9) 
-            ax.set_title(f"みんなのXP比較グラフ ({'やった日から全記録' if is_continuous else title})", fontsize=15)
-            ax.grid(True, linestyle='--', alpha=0.6)
-            ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
-            plt.tight_layout()
-            
-            fname = f'all_{int(time.time())}.png'
             plt.savefig(fname); plt.close(); await message.channel.send(file=discord.File(fname))
 
         # ランキング
