@@ -1,18 +1,48 @@
 import discord
 from discord import app_commands
-importCJK-Regular.ttc"import re
+import re
+import os
+import time
+import random
+import urllib.request
+import json
+import asyncio
+import io
+from datetime import datetime, timedelta, timezone
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import matplotlib.dates as mdates
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "I am alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+Thread(target=run_flask, daemon=True).start()
+
+def setup_font():
+    font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Regular.ttc"
     font_path = "NotoSansCJK.ttc"
+
     try:
         if not os.path.exists(font_path):
             urllib.request.urlretrieve(font_url, font_path)
+
         fm.fontManager.addfont(font_path)
         plt.rcParams['font.family'] = 'Noto Sans CJK JP'
+
     except Exception as e:
         print(f"Font setup warning: {e}")
         plt.rcParams['font.family'] = 'sans-serif'
 
 setup_font()
-
 # ==================== 設定 ====================
 TOKEN = os.environ.get('DISCORD_TOKEN')
 if not TOKEN:
