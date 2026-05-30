@@ -63,7 +63,7 @@ JST = timezone(timedelta(hours=+9), 'JST')
 # ---------------------------------------------------------
 def fetch_splatoon_schedule():
     url = "https://splatoon3.ink/data/schedules.json"
-    req = urllib.request.Request(url, headers={'User-Agent': 'XP-Bot/1.0'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'XP-Bot/1.2'})
     with urllib.request.urlopen(req) as res:
         return json.loads(res.read().decode())
 
@@ -73,26 +73,34 @@ async def get_real_area_time(now_dt):
         x_schedules = data.get("data", {}).get("xSchedules", {}).get("nodes", [])
         area_shifts = []
         for node in x_schedules:
-            if not node or not node.get("startTime") or not node.get("rule"): continue
-            if node["rule"]["rule"] == "AREA": # ガチエリアを抽出
+            if not node or not node.get("startTime"): continue
+            
+            # 【修正点】JSONの正しい階層(xMatchSetting)からルールを抽出
+            setting = node.get("xMatchSetting")
+            if not setting: continue # フェス中などで設定が無い枠をスキップ
+            
+            rule = setting.get("vsRule", {}).get("rule")
+            if rule == "AREA": # ガチエリア
                 st = datetime.strptime(node["startTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                 et = datetime.strptime(node["endTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                 area_shifts.append((st, et))
         
         area_shifts.sort(key=lambda x: x[0])
         best_et = None
-        # 「現在時刻」以前に始まった一番新しいエリア枠を探す
+        
+        # 現在時刻以前に始まった最新の「エリア」枠を探す
         for st, et in area_shifts:
             if st <= now_dt:
-                best_et = et
-        
+                best_et = et # 常に最新のエリアの終了時刻に更新されていく
+                
         if best_et:
-            return best_et.astimezone(JST) # その枠の「終了時刻」を返す
+            return best_et.astimezone(JST) # 最も直近のエリアの「終了時刻」を返す
+            
     except Exception as e:
         print(f"API Fetch Error: {e}")
     return None
 
-# 万が一APIが落ちていた場合の予備ロジック（偶数時間に丸める）
+# API取得失敗時の保険
 def fallback_splat_time(dt):
     base_midnight = datetime(dt.year, dt.month, dt.day, 0, 0, tzinfo=JST)
     seconds_from_midnight = (dt - base_midnight).total_seconds()
@@ -116,7 +124,8 @@ def parse_args_from_str(text, current_year, current_season_type):
             break
             
     if month_match:
-        return target_year, None, int(month_match.group(1)), False, f"{target_year}年 {int(month_match.group(1))}月", is_continuous
+        target_month = int(month_match.group(1))
+        return target_year, None, target_month, False, f"{target_year}年 {target_month}月", is_continuous
     elif season_match:
         return target_year, season_match, None, False, f"{target_year}年 {season_match}", is_continuous
     else:
@@ -164,7 +173,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} がAPIスケジュール同期モードで起動しました！')
+    print(f'{client.user} がスケジュール同期修正版で起動しました！')
 
 # ==================== スラッシュコマンド群 ====================
 
@@ -413,10 +422,9 @@ async def on_message(message):
             
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
-                # ★APIから時間を取得して同期
                 splat_time = await get_real_area_time(now)
                 if not splat_time:
-                    splat_time = fallback_splat_time(now) # API取得失敗時の保険
+                    splat_time = fallback_splat_time(now)
                 
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
