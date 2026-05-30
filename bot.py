@@ -64,7 +64,7 @@ CACHED_AREA_SHIFTS = set()
 async def update_and_get_last_area_time(now_dt):
     global CACHED_AREA_SHIFTS
     try:
-        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.4'})
+        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.5'})
         res = await asyncio.to_thread(urllib.request.urlopen, req)
         data = json.loads(res.read().decode())
         
@@ -177,7 +177,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が起動しました（編集時完了メッセージ通知版）！')
+    print(f'{client.user} が起動しました（案内文スマート非表示版）！')
 
 # ==================== スラッシュコマンド群 ====================
 
@@ -426,15 +426,18 @@ async def on_message(message):
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
                 
-                splat_time = await update_and_get_last_area_time(now)
-                is_manual = True
+                # ─── ★自信度（is_confident）を使ったスマートなロジック ───
+                splat_time = parse_specified_time(message.content, now)
+                is_confident = True # 手動入力は自信満々
                 
                 if not splat_time:
-                    splat_time = parse_specified_time(message.content, now)
+                    splat_time = await update_and_get_last_area_time(now)
+                    # APIやキャッシュから取れたら自信満々
                 
                 if not splat_time:
                     splat_time = get_last_splat_end_time(now)
-                    is_manual = False
+                    is_confident = False # APIも記憶も全滅して予備ロジックに頼った時だけ自信喪失
+                # ────────────────────────────────────────────────────────
                 
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
@@ -482,15 +485,15 @@ async def on_message(message):
                     elif diff_above <= 30:
                         drama_msg += random.choice([
                             f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全にメインの射程圏内です！"
+                            f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
                         ])
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
                 
                 start_time = splat_time - timedelta(hours=2)
                 notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
-                if not is_manual:
-                    notice += "\n💡 ※時間が違った場合は、チャットを編集してエリアの『終了時間（例：17:00）』を書き足してください！"
+                if not is_confident:
+                    notice += "\n💡 ※時間が違った場合は、チャットを編集して『17:00』のように終了時間を書き足してください！"
                 
                 await message.channel.send(f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}")
 
@@ -505,12 +508,11 @@ async def on_raw_message_delete(payload):
             if len(p) >= 6 and str(payload.message_id) == p[5]:
                 await m_log.delete(); break
 
-# 【最重要アップデート】編集完了を画面上に都度通知する機能を追加
 @client.event
 async def on_raw_message_edit(payload):
     if payload.channel_id != TARGET_CHANNEL_ID: return
     log_channel = client.get_channel(LOG_CHANNEL_ID)
-    target_channel = client.get_channel(TARGET_CHANNEL_ID) # ★通知送信用に取得
+    target_channel = client.get_channel(TARGET_CHANNEL_ID)
     content = payload.data.get('content')
     if not log_channel or not content: return
     match = re.search(r'xp\s*([0-9]+)|([0-9]+)\s*xp', content, re.IGNORECASE)
@@ -527,12 +529,10 @@ async def on_raw_message_edit(payload):
                     if spec_time:
                         p[3] = spec_time.strftime('%Y/%m/%d %H:%M')
                         
-                        # ─── ★新機能: 編集が成功したことをチャット枠に明記する ───
                         if target_channel:
                             start_time = spec_time - timedelta(hours=2)
                             time_range_str = f"{start_time.strftime('%H:%M')}ー{spec_time.strftime('%H:%M')}"
                             await target_channel.send(f"🔄 記録枠を **{time_range_str}** に変更しました！")
-                        # ──────────────────────────────────────────
                     
                     await m_log.edit(content="|".join(p))
                 else:
