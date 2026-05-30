@@ -3,26 +3,7 @@ from discord import app_commands
 import re
 import os
 import time
-!"import random
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-Thread(target=run_flask, daemon=True).start()
-
-# ==================== 日本語フォント設定 ====================
-
-def setup_font():
-    font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Regular.ttc"
-    font_path = "NotoSansCJK.ttc"
-
-    try:
-        if not os.path.exists(font_path):
-            urllib.request.urlretrieve(font_url, font_path)
-
-        fm.fontManager.addfont(font_path)
-        plt.rcParams['font.family'] = 'Noto Sans CJK JP'
+import['font.family'] = 'Noto Sans CJK JP'import random
 
     except Exception as e:
         print(f"Font setup warning: {e}")
@@ -42,7 +23,7 @@ LOG_CHANNEL_ID = 1508739566138294522
 ARCHIVE_CHANNEL_ID = 1510291838957912285
 
 # 一時的にユーザー名で管理者判定
-ADMIN_USERS = ["poqoppo", "ricekei"]
+ADMIN_USERS = ["poqoppo", "ricekein", "ricekei"]
 
 SETTINGS_FILE = "settings.json"
 
@@ -1354,3 +1335,22 @@ app = Flask('')
 
 @app.route('/')
 def home():
+    return "I am alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+Thread(target=run_flask, daemon=True).start()
+
+# ==================== 日本語フォント設定 ====================
+
+def setup_font():
+    font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Regular.ttc"
+    font_path = "NotoSansCJK.ttc"
+
+    try:
+        if not os.path.exists(font_path):
+            urllib.request.urlretrieve(font_url, font_path)
+
+        fm.fontManager.addfont(font_path)
