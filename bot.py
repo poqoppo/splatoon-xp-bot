@@ -3,29 +3,15 @@ from discord import app_commands
 import re
 import os
 import time
-import random
-import urllib.request
-import json
-import asyncio
-import io
-from datetime import datetime, timedelta, timezone
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-import matplotlib.dates as mdates
-from flask import Flask
-from threading import Thread
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "I am alive!"
+!"import random
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 Thread(target=run_flask, daemon=True).start()
+
+# ==================== 日本語フォント設定 ====================
 
 def setup_font():
     font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTC/NotoSansCJK-Regular.ttc"
@@ -43,8 +29,11 @@ def setup_font():
         plt.rcParams['font.family'] = 'sans-serif'
 
 setup_font()
+
 # ==================== 設定 ====================
+
 TOKEN = os.environ.get('DISCORD_TOKEN')
+
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN が設定されていません")
 
@@ -56,6 +45,7 @@ ARCHIVE_CHANNEL_ID = 1510291838957912285
 ADMIN_USERS = ["poqoppo", "ricekei"]
 
 SETTINGS_FILE = "settings.json"
+
 DEFAULT_SETTINGS = {
     "drama_enabled": True,
     "area_notice_enabled": True,
@@ -64,17 +54,21 @@ DEFAULT_SETTINGS = {
 ARCHIVE_THRESHOLD = 4500
 ARCHIVE_HISTORY_LIMIT = 5000
 DELETE_SLEEP_SECONDS = 0.15
-# ==============================================
+
+# ==================== 設定ファイル ====================
 
 def load_settings():
     if not os.path.exists(SETTINGS_FILE):
         return DEFAULT_SETTINGS.copy()
+
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         settings = DEFAULT_SETTINGS.copy()
         settings.update(data)
         return settings
+
     except Exception as e:
         print(f"Settings load error: {e}")
         return DEFAULT_SETTINGS.copy()
@@ -83,6 +77,7 @@ def save_settings():
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(BOT_SETTINGS, f, ensure_ascii=False, indent=2)
+
     except Exception as e:
         print(f"Settings save error: {e}")
 
@@ -90,6 +85,8 @@ BOT_SETTINGS = load_settings()
 
 def is_admin(user: discord.User):
     return user.name in ADMIN_USERS
+
+# ==================== Discord Client ====================
 
 class XPClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
@@ -101,7 +98,10 @@ class XPClient(discord.Client):
 
 intents = discord.Intents.default()
 intents.message_content = True
+
 client = XPClient(intents=intents)
+
+# ==================== グローバル ====================
 
 JST = timezone(timedelta(hours=+9), 'JST')
 
@@ -109,6 +109,7 @@ CACHED_AREA_SHIFTS = set()
 CACHED_AREA_DETAILS = []
 LAST_SCHEDULE_FETCH = None
 SCHEDULE_CACHE_SECONDS = 600
+
 archive_lock = asyncio.Lock()
 
 # ==================== シーズン ====================
@@ -133,12 +134,15 @@ def get_previous_season_for_award(now_dt):
         return now_dt.year, "夏シーズン"
     elif now_dt.month == 12:
         return now_dt.year, "秋シーズン"
+
     return now_dt.year, "不明シーズン"
 
 def parse_api_datetime(value):
     dt = datetime.fromisoformat(value)
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=JST)
+
     return dt.astimezone(JST)
 
 # ==================== JSONログ ====================
@@ -153,6 +157,7 @@ def make_record_json(user_id, user_name, xp, record_time, season, message_id):
         "season": str(season),
         "message_id": int(message_id),
     }
+
     return json.dumps(record, ensure_ascii=False)
 
 def parse_time_str(t_str, fallback_created_at=None):
@@ -167,12 +172,15 @@ def parse_time_str(t_str, fallback_created_at=None):
             return datetime.now(JST)
 
 def parse_log_record(content, fallback_created_at=None):
+    # JSON形式
     try:
         obj = json.loads(content)
+
         if obj.get("type") != "xp_record":
             return None
 
         uid = int(obj["user_id"])
+
         return {
             "user_id": uid,
             "user_name": str(obj.get("user_name", f"ID:{uid}")),
@@ -182,17 +190,29 @@ def parse_log_record(content, fallback_created_at=None):
             "message_id": int(obj.get("message_id", 0)),
             "raw_type": "json",
         }
+
     except Exception:
         pass
 
+    # 旧 | 区切り形式
     try:
         p = content.split('|')
+
         if len(p) >= 4:
             uid = int(p[0])
+
             if len(p) >= 6:
-                uname, xp, t_str, season, msg_id = p[1], int(p[2]), p[3], p[4], int(p[5])
+                uname = p[1]
+                xp = int(p[2])
+                t_str = p[3]
+                season = p[4]
+                msg_id = int(p[5])
             else:
-                uname, xp, t_str, season, msg_id = f"ID:{uid}", int(p[1]), p[2], p[3], 0
+                uname = f"ID:{uid}"
+                xp = int(p[1])
+                t_str = p[2]
+                season = p[3]
+                msg_id = 0
 
             return {
                 "user_id": uid,
@@ -203,6 +223,7 @@ def parse_log_record(content, fallback_created_at=None):
                 "message_id": msg_id,
                 "raw_type": "pipe",
             }
+
     except Exception:
         return None
 
@@ -218,6 +239,7 @@ def record_to_log_content(record):
         "season": str(record["season"]),
         "message_id": int(record.get("message_id", 0)),
     }
+
     return json.dumps(obj, ensure_ascii=False)
 
 def record_to_archive_obj(record):
@@ -235,7 +257,9 @@ def parse_archive_record_obj(obj):
     try:
         if obj.get("type") != "xp_record":
             return None
+
         uid = int(obj["user_id"])
+
         return {
             "user_id": uid,
             "user_name": str(obj.get("user_name", f"ID:{uid}")),
@@ -245,14 +269,21 @@ def parse_archive_record_obj(obj):
             "message_id": int(obj.get("message_id", 0)),
             "raw_type": "archive_json",
         }
+
     except Exception:
         return None
 
 def make_record_unique_key(record):
     msg_id = int(record.get("message_id", 0))
+
     if msg_id != 0:
         return f"msg:{msg_id}"
-    return f"fallback:{record['user_id']}:{record['time'].strftime('%Y/%m/%d %H:%M')}:{record['xp']}:{record['season']}"
+
+    return (
+        f"fallback:{record['user_id']}:"
+        f"{record['time'].strftime('%Y/%m/%d %H:%M')}:"
+        f"{record['xp']}:{record['season']}"
+    )
 
 # ==================== スプラAPI ====================
 
@@ -274,6 +305,7 @@ async def fetch_area_schedule(force=False):
             "https://spla3.yuu26.com/api/x/schedule",
             headers={'User-Agent': 'XP-Bot/3.1'}
         )
+
         res = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
         data = json.loads(res.read().decode())
 
@@ -306,6 +338,7 @@ async def update_and_get_last_area_time(now_dt):
     await fetch_area_schedule()
 
     best_et = None
+
     for st, et in CACHED_AREA_SHIFTS:
         if st <= now_dt:
             if best_et is None or et > best_et:
@@ -316,7 +349,11 @@ async def update_and_get_last_area_time(now_dt):
 async def get_next_area_shift(now_dt):
     await fetch_area_schedule()
 
-    candidates = [d for d in CACHED_AREA_DETAILS if d["start"] > now_dt]
+    candidates = [
+        d for d in CACHED_AREA_DETAILS
+        if d["start"] > now_dt
+    ]
+
     if not candidates:
         return None
 
@@ -325,23 +362,31 @@ async def get_next_area_shift(now_dt):
 
 def get_last_splat_end_time(dt):
     h = dt.hour
+
     if h % 2 == 0:
         h -= 1
+
     if h < 0:
         h = 23
         dt = dt - timedelta(days=1)
+
     return dt.replace(hour=h, minute=0, second=0, microsecond=0)
 
 def parse_specified_time(content, now_dt):
     m1 = re.search(r'([0-9]{1,2}):([0-9]{2})', content)
+
     if m1:
-        h, m = int(m1.group(1)), int(m1.group(2))
+        h = int(m1.group(1))
+        m = int(m1.group(2))
+
         if 0 <= h < 24 and 0 <= m < 60:
             return now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
 
     m2 = re.search(r'([0-9]{1,2})時', content)
+
     if m2:
         h = int(m2.group(1))
+
         if 0 <= h < 24:
             return now_dt.replace(hour=h, minute=0, second=0, microsecond=0)
 
@@ -354,6 +399,7 @@ def parse_args_from_str(text, current_year, current_season_type):
         text = ""
 
     is_continuous = "通し" in text or "やった日から" in text
+
     target_year = str(current_year)
 
     year_match = re.search(r'([0-9]{4})年', text)
@@ -363,6 +409,7 @@ def parse_args_from_str(text, current_year, current_season_type):
     month_match = re.search(r'([0-9]{1,2})月', text)
 
     season_match = None
+
     for s in ["春シーズン", "夏シーズン", "秋シーズン", "冬シーズン", "春", "夏", "秋", "冬"]:
         if s in text:
             season_match = s if "シーズン" in s else f"{s}シーズン"
@@ -371,8 +418,10 @@ def parse_args_from_str(text, current_year, current_season_type):
     if month_match:
         target_month = int(month_match.group(1))
         return target_year, None, target_month, False, f"{target_year}年 {target_month}月", is_continuous
+
     elif season_match:
         return target_year, season_match, None, False, f"{target_year}年 {season_match}", is_continuous
+
     else:
         return target_year, None, None, True, "全期間", is_continuous
 
@@ -381,16 +430,24 @@ def get_graph_bounds(year_str, season_str, month_int):
 
     if month_int:
         start = datetime(y, month_int, 1, 0, 0, tzinfo=JST)
-        end = datetime(y + 1, 1, 1, 0, 0, tzinfo=JST) if month_int == 12 else datetime(y, month_int + 1, 1, 0, 0, tzinfo=JST)
+
+        if month_int == 12:
+            end = datetime(y + 1, 1, 1, 0, 0, tzinfo=JST)
+        else:
+            end = datetime(y, month_int + 1, 1, 0, 0, tzinfo=JST)
+
         return start, end
 
     if season_str:
         if "春" in season_str:
             return datetime(y, 3, 1, 0, 0, tzinfo=JST), datetime(y, 6, 1, 0, 0, tzinfo=JST)
+
         if "夏" in season_str:
             return datetime(y, 6, 1, 0, 0, tzinfo=JST), datetime(y, 9, 1, 0, 0, tzinfo=JST)
+
         if "秋" in season_str:
             return datetime(y, 9, 1, 0, 0, tzinfo=JST), datetime(y, 12, 1, 0, 0, tzinfo=JST)
+
         if "冬" in season_str:
             return datetime(y, 12, 1, 0, 0, tzinfo=JST), datetime(y + 1, 3, 1, 0, 0, tzinfo=JST)
 
@@ -410,6 +467,7 @@ async def get_current_log_records_with_messages():
             continue
 
         record = parse_log_record(message.content, message.created_at)
+
         if record:
             items.append((message, record))
 
@@ -429,6 +487,7 @@ async def get_archive_records():
         for attachment in message.attachments:
             if not attachment.filename.startswith("xp_archive_"):
                 continue
+
             if not attachment.filename.endswith(".json"):
                 continue
 
@@ -441,6 +500,7 @@ async def get_archive_records():
 
                 for rec_obj in obj.get("records", []):
                     record = parse_archive_record_obj(rec_obj)
+
                     if record:
                         records.append(record)
 
@@ -467,7 +527,11 @@ async def auto_archive_if_needed(force=False):
             return False, count, "しきい値未満です"
 
         now = datetime.now(JST)
-        records = [record_to_archive_obj(record) for _, record in items]
+
+        records = [
+            record_to_archive_obj(record)
+            for _, record in items
+        ]
 
         archive_obj = {
             "type": "xp_archive",
@@ -489,15 +553,18 @@ async def auto_archive_if_needed(force=False):
                 ),
                 file=discord.File(file_obj, filename=fname)
             )
+
         except Exception as e:
             return False, count, f"アーカイブ送信失敗: {e}"
 
         deleted_count = 0
+
         for msg, _ in items:
             try:
                 await msg.delete()
                 deleted_count += 1
                 await asyncio.sleep(DELETE_SLEEP_SECONDS)
+
             except Exception as e:
                 print(f"Archive delete error: {e}")
 
@@ -508,13 +575,16 @@ async def get_all_records():
     seen = set()
 
     all_records = []
-    all_records.extend(await get_archive_records())
+
+    archive_records = await get_archive_records()
+    all_records.extend(archive_records)
 
     current_items = await get_current_log_records_with_messages()
     all_records.extend([record for _, record in current_items])
 
     for record in all_records:
         key = make_record_unique_key(record)
+
         if key in seen:
             continue
 
@@ -557,7 +627,11 @@ async def on_ready():
     煽り文章="XP保存後の煽り文章を表示するか",
     エリア通知="XP保存後に次のガチエリア時間とステージを表示するか"
 )
-async def notification_settings(interaction: discord.Interaction, 煽り文章: bool = None, エリア通知: bool = None):
+async def notification_settings(
+    interaction: discord.Interaction,
+    煽り文章: bool = None,
+    エリア通知: bool = None
+):
     await interaction.response.defer(ephemeral=True)
 
     if not is_admin(interaction.user):
@@ -655,6 +729,7 @@ async def graph(interaction: discord.Interaction, 期間: str = None):
         return
 
     fig, ax = plt.subplots(figsize=(12, 6))
+
     indices = list(range(len(recs)))
     xps = [r['xp'] for r in recs]
 
@@ -665,6 +740,7 @@ async def graph(interaction: discord.Interaction, 期間: str = None):
 
     ax.set_title(f"{interaction.user.display_name} さんの成長記録 ({title})", fontsize=15)
     ax.grid(True, linestyle='--', alpha=0.6)
+
     plt.tight_layout()
 
     fname = f'g_{interaction.user.id}_{int(time.time())}.png'
@@ -700,6 +776,7 @@ async def comp_graph(
     all_d = await get_all_records()
 
     targets = [interaction.user.id]
+
     if 相手1:
         targets.append(相手1.id)
     if 相手2:
@@ -708,10 +785,12 @@ async def comp_graph(
         targets.append(相手3.id)
 
     targets = list(set(targets))
+
     is_all = len(targets) == 1
     target_ids = list(all_d.keys()) if is_all else targets
 
     fig, ax = plt.subplots(figsize=(12, 6))
+
     plot_data = []
     max_time = None
 
@@ -730,6 +809,7 @@ async def comp_graph(
 
         if recs:
             plot_data.append((info['name'], recs))
+
             if max_time is None or recs[-1]['time'] > max_time:
                 max_time = recs[-1]['time']
 
@@ -745,14 +825,22 @@ async def comp_graph(
         line, = ax.plot(times, xps, marker='o', linewidth=1.5, markersize=4, label=name)
 
         if max_time and times[-1] < max_time:
-            ax.plot([times[-1], max_time], [xps[-1], xps[-1]], color=line.get_color(), linewidth=1.5, marker='')
+            ax.plot(
+                [times[-1], max_time],
+                [xps[-1], xps[-1]],
+                color=line.get_color(),
+                linewidth=1.5,
+                marker=''
+            )
 
     if not ia and not is_continuous:
         start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
+
         if start_bounds and end_bounds:
             ax.set_xlim(start_bounds, end_bounds)
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+
     plt.xticks(rotation=90, fontsize=9)
 
     graph_title = "みんなのXP比較グラフ" if is_all else "指定メンバーのXP比較グラフ"
@@ -760,6 +848,7 @@ async def comp_graph(
 
     ax.grid(True, linestyle='--', alpha=0.6)
     ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+
     plt.tight_layout()
 
     fname = f'comp_{interaction.user.id}_{int(time.time())}.png'
@@ -803,6 +892,7 @@ async def ranking(interaction: discord.Interaction, 期間: str = None):
     ranking_list.sort(key=lambda x: x[1], reverse=True)
 
     res = f"🏆 **{title} ランキング** 🏆\n\n"
+
     for i, (name, xp) in enumerate(ranking_list[:10]):
         medal = ['🥇', '🥈', '🥉'][i] if i < 3 else f"**{i + 1}位**"
         res += f"{medal}：{name} ({xp} XP)\n"
@@ -823,11 +913,13 @@ async def award(interaction: discord.Interaction):
     target_season_str = f"{target_year}年 {target_s_type}"
 
     all_d = await get_all_records()
+
     most_played = []
     last_spurt = []
 
     for uid, info in all_d.items():
         s_recs = [r for r in info['records'] if r['season'] == target_season_str]
+
         if not s_recs:
             continue
 
@@ -835,10 +927,12 @@ async def award(interaction: discord.Interaction):
 
         if len(s_recs) >= 2:
             base = s_recs[0]
+
             for r in reversed(s_recs):
                 if r['time'] <= s_recs[-1]['time'] - timedelta(days=7):
                     base = r
                     break
+
             last_spurt.append((info['name'], s_recs[-1]['xp'] - base['xp']))
         else:
             last_spurt.append((info['name'], 0))
@@ -982,6 +1076,7 @@ async def reset_all_data(interaction: discord.Interaction, 確認: str):
     async for m_log in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT):
         if m_log.author == client.user:
             record = parse_log_record(m_log.content, m_log.created_at)
+
             if record:
                 await m_log.delete()
                 deleted_count += 1
@@ -1003,152 +1098,169 @@ async def on_message(message):
     season_year, current_season_type = get_current_season(now)
     curr_season_full_str = f"{season_year}年 {current_season_type}"
 
-    if message.channel.id == TARGET_CHANNEL_ID:
-        match = re.search(r'xp\s*([0-9]+)|([0-9]+)\s*xp', message.content, re.IGNORECASE)
+    if message.channel.id != TARGET_CHANNEL_ID:
+        return
 
-        if match:
-            new_xp = int(match.group(1) or match.group(2))
+    match = re.search(r'xp\s*([0-9]+)|([0-9]+)\s*xp', message.content, re.IGNORECASE)
 
-            if not (500 <= new_xp < 5000):
-                await message.channel.send("⚠️ パワーは500〜5000で入力してください！")
-                return
+    if not match:
+        return
 
-            all_d = await get_all_records()
-            current_season_xps = {}
+    new_xp = int(match.group(1) or match.group(2))
 
-            for uid, info in all_d.items():
-                s_recs = [r for r in info['records'] if r['season'] == curr_season_full_str]
-                if s_recs:
-                    current_season_xps[uid] = (info['name'], s_recs[-1]['xp'])
+    if not (500 <= new_xp < 5000):
+        await message.channel.send("⚠️ パワーは500〜5000で入力してください！")
+        return
 
-            old_xp = current_season_xps.get(message.author.id, (message.author.display_name, None))[1]
+    all_d = await get_all_records()
 
-            if message.author.id in all_d and all_d[message.author.id]['records']:
-                last_xp = all_d[message.author.id]['records'][-1]['xp']
-                if abs(new_xp - last_xp) > 500:
-                    await message.channel.send(
-                        f"⚠️ 前回記録({last_xp} XP)から±500以上の急激な増減があるため保存できません！"
-                    )
-                    return
+    current_season_xps = {}
 
-            log_channel = client.get_channel(LOG_CHANNEL_ID)
+    for uid, info in all_d.items():
+        s_recs = [r for r in info['records'] if r['season'] == curr_season_full_str]
 
-            if log_channel:
-                splat_time = parse_specified_time(message.content, now)
-                is_confident = True
+        if s_recs:
+            current_season_xps[uid] = (info['name'], s_recs[-1]['xp'])
 
-                if not splat_time:
-                    splat_time = await update_and_get_last_area_time(now)
+    old_xp = current_season_xps.get(message.author.id, (message.author.display_name, None))[1]
 
-                if not splat_time:
-                    splat_time = get_last_splat_end_time(now)
-                    is_confident = False
+    if message.author.id in all_d and all_d[message.author.id]['records']:
+        last_xp = all_d[message.author.id]['records'][-1]['xp']
 
-                await log_channel.send(
-                    make_record_json(
-                        user_id=message.author.id,
-                        user_name=message.author.display_name,
-                        xp=new_xp,
-                        record_time=splat_time,
-                        season=curr_season_full_str,
-                        message_id=message.id
-                    )
-                )
+        if abs(new_xp - last_xp) > 500:
+            await message.channel.send(
+                f"⚠️ 前回記録({last_xp} XP)から±500以上の急激な増減があるため保存できません！"
+            )
+            return
 
-                updated_xps = current_season_xps.copy()
-                updated_xps[message.author.id] = (message.author.display_name, new_xp)
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
 
-                passed_users = []
-                overtaken_users = []
+    if not log_channel:
+        await message.channel.send("⚠️ ログチャンネルが見つかりません。")
+        return
 
-                for uid, (name, xp) in current_season_xps.items():
-                    if uid == message.author.id:
-                        continue
+    splat_time = parse_specified_time(message.content, now)
+    is_confident = True
 
-                    if (old_xp is not None and xp >= old_xp and new_xp > xp) or (old_xp is None and new_xp > xp):
-                        passed_users.append(name)
+    if not splat_time:
+        splat_time = await update_and_get_last_area_time(now)
 
-                    if old_xp is not None and xp < old_xp and new_xp < xp:
-                        overtaken_users.append(name)
+    if not splat_time:
+        splat_time = get_last_splat_end_time(now)
+        is_confident = False
 
-                sorted_ranking = sorted(updated_xps.items(), key=lambda x: x[1][1], reverse=True)
+    await log_channel.send(
+        make_record_json(
+            user_id=message.author.id,
+            user_name=message.author.display_name,
+            xp=new_xp,
+            record_time=splat_time,
+            season=curr_season_full_str,
+            message_id=message.id
+        )
+    )
 
-                my_index = -1
-                for idx, (uid, _) in enumerate(sorted_ranking):
-                    if uid == message.author.id:
-                        my_index = idx
-                        break
+    updated_xps = current_season_xps.copy()
+    updated_xps[message.author.id] = (message.author.display_name, new_xp)
 
-                drama_msg = ""
+    passed_users = []
+    overtaken_users = []
 
-                if BOT_SETTINGS.get("drama_enabled", True):
-                    if passed_users:
-                        names_str = "、".join(passed_users)
-                        drama_msg += random.choice([
-                            f"\n⚔️ **【下剋上】** {names_str}さんをブチ抜きました！後ろに気をつけてくださいね〜？😜",
-                            f"\n🔥 **【ジャイアントキリング】** {names_str}さんを抜き去りました！ナイス精神攻撃！"
-                        ])
-                    elif overtaken_users:
-                        names_str = "、".join(overtaken_users)
-                        drama_msg += random.choice([
-                            f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？さっさと取り返しましょう！💥",
-                            f"\n📉 **【煽り運転感知】** {names_str}さんにスマートにパスされました。悔しさをバネに次、潜りましょう！"
-                        ])
+    for uid, (name, xp) in current_season_xps.items():
+        if uid == message.author.id:
+            continue
 
-                    if my_index == 0:
-                        drama_msg += "\n👑 **現在トップ独走中！** このまま連勝して逃げ切りましょう！"
-                        if len(sorted_ranking) > 1:
-                            _, (next_name, next_xp) = sorted_ranking[1]
-                            drama_msg += f"（2位の{next_name}さんとは **XP {new_xp - next_xp}** 差）"
-                    else:
-                        _, (above_name, above_xp) = sorted_ranking[my_index - 1]
-                        diff_above = above_xp - new_xp
+        if (old_xp is not None and xp >= old_xp and new_xp > xp) or (old_xp is None and new_xp > xp):
+            passed_users.append(name)
 
-                        if diff_above == 0:
-                            drama_msg += f"\n🔥 1つ上の{above_name}さんと **完全にXPが並びました！** 次の1勝で一気に引き離そう！"
-                        elif diff_above <= 30:
-                            drama_msg += random.choice([
-                                f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                                f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
-                            ])
-                        else:
-                            drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
+        if old_xp is not None and xp < old_xp and new_xp < xp:
+            overtaken_users.append(name)
 
-                start_time = splat_time - timedelta(hours=2)
-                notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
+    sorted_ranking = sorted(updated_xps.items(), key=lambda x: x[1][1], reverse=True)
 
-                if not is_confident:
-                    notice += "\n💡 ※時間が違った場合は、チャットを編集して『17:00』のように終了時間を書き足してください！"
+    my_index = -1
 
-                area_msg = ""
+    for idx, (uid, _) in enumerate(sorted_ranking):
+        if uid == message.author.id:
+            my_index = idx
+            break
 
-                if BOT_SETTINGS.get("area_notice_enabled", True):
-                    next_area = await get_next_area_shift(now)
+    drama_msg = ""
 
-                    if next_area:
-                        ns = next_area["start"]
-                        ne = next_area["end"]
-                        stages = next_area["stages"]
-                        stage_text = " / ".join(stages) if stages else "ステージ情報なし"
+    if BOT_SETTINGS.get("drama_enabled", True):
+        if passed_users:
+            names_str = "、".join(passed_users)
+            drama_msg += random.choice([
+                f"\n⚔️ **【下剋上】** {names_str}さんをブチ抜きました！後ろに気をつけてくださいね〜？😜",
+                f"\n🔥 **【ジャイアントキリング】** {names_str}さんを抜き去りました！ナイス精神攻撃！"
+            ])
 
-                        area_msg = (
-                            f"\n\n🗓️ **次のガチエリア**\n"
-                            f"**{ns.strftime('%m/%d %H:%M')} - {ne.strftime('%H:%M')}**\n"
-                            f"🗺️ ステージ：**{stage_text}**"
-                        )
-                    else:
-                        area_msg = "\n\n🗓️ **次のガチエリア**\n現在、次回エリア情報を取得できませんでした。"
+        elif overtaken_users:
+            names_str = "、".join(overtaken_users)
+            drama_msg += random.choice([
+                f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？さっさと取り返しましょう！💥",
+                f"\n📉 **【煽り運転感知】** {names_str}さんにスマートにパスされました。悔しさをバネに次、潜りましょう！"
+            ])
 
-                await message.channel.send(
-                    f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}{area_msg}"
-                )
+        if my_index == 0:
+            drama_msg += "\n👑 **現在トップ独走中！** このまま連勝して逃げ切りましょう！"
 
-                success, archived_count, archive_msg = await auto_archive_if_needed(force=False)
+            if len(sorted_ranking) > 1:
+                _, (next_name, next_xp) = sorted_ranking[1]
+                drama_msg += f"（2位の{next_name}さんとは **XP {new_xp - next_xp}** 差）"
 
-                if success:
-                    await message.channel.send(
-                        f"📦 XPログが多くなったため、**{archived_count}件** を自動アーカイブしました！"
-                    )
+        else:
+            _, (above_name, above_xp) = sorted_ranking[my_index - 1]
+            diff_above = above_xp - new_xp
+
+            if diff_above == 0:
+                drama_msg += f"\n🔥 1つ上の{above_name}さんと **完全にXPが並びました！** 次の1勝で一気に引き離そう！"
+
+            elif diff_above <= 30:
+                drama_msg += random.choice([
+                    f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
+                    f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！"
+                ])
+
+            else:
+                drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
+
+    start_time = splat_time - timedelta(hours=2)
+    notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
+
+    if not is_confident:
+        notice += "\n💡 ※時間が違った場合は、チャットを編集して『17:00』のように終了時間を書き足してください！"
+
+    area_msg = ""
+
+    if BOT_SETTINGS.get("area_notice_enabled", True):
+        next_area = await get_next_area_shift(now)
+
+        if next_area:
+            ns = next_area["start"]
+            ne = next_area["end"]
+            stages = next_area["stages"]
+            stage_text = " / ".join(stages) if stages else "ステージ情報なし"
+
+            area_msg = (
+                f"\n\n🗓️ **次のガチエリア**\n"
+                f"**{ns.strftime('%m/%d %H:%M')} - {ne.strftime('%H:%M')}**\n"
+                f"🗺️ ステージ：**{stage_text}**"
+            )
+
+        else:
+            area_msg = "\n\n🗓️ **次のガチエリア**\n現在、次回エリア情報を取得できませんでした。"
+
+    await message.channel.send(
+        f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}{area_msg}"
+    )
+
+    success, archived_count, archive_msg = await auto_archive_if_needed(force=False)
+
+    if success:
+        await message.channel.send(
+            f"📦 XPログが多くなったため、**{archived_count}件** を自動アーカイブしました！"
+        )
 
 @client.event
 async def on_raw_message_delete(payload):
@@ -1177,6 +1289,7 @@ async def on_raw_message_edit(payload):
 
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     target_channel = client.get_channel(TARGET_CHANNEL_ID)
+
     content = payload.data.get('content')
 
     if not log_channel or not content:
@@ -1217,15 +1330,13 @@ async def on_raw_message_edit(payload):
                     await target_channel.send(f"🔄 記録枠を **{time_range_str}** に変更しました！")
 
             await m_log.edit(content=record_to_log_content(record))
+
         else:
             await m_log.delete()
 
         break
 
 client.run(TOKEN)
-import os
-import time
-import random
 import urllib.request
 import json
 import asyncio
@@ -1237,16 +1348,9 @@ import matplotlib.dates as mdates
 from flask import Flask
 from threading import Thread
 
+# ==================== Flaskサーバー用 Renderスリープ防止 ====================
+
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "I am alive!"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-Thread(target=run_flask, daemon=True).start()
-
-def setup_font():
