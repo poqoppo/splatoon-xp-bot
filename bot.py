@@ -34,7 +34,7 @@ setup_font()
 
 # ==================== 【設定部分】 ====================
 TOKEN = os.environ.get('DISCORD_TOKEN')
-TARGET_CHANNEL_ID =  1474973509217423401 # ★XP報告するチャンネルID
+TARGET_CHANNEL_ID = 1474973509217423401 # ★XP報告するチャンネルID
 LOG_CHANNEL_ID = 1508739566138294522    # ★バックアップ用チャンネルID
 # ====================================================
 
@@ -45,7 +45,6 @@ client = discord.Client(intents=intents)
 # 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
-# 引数解析を「月指定」に対応拡張
 def parse_args(content, current_year, current_season_type):
     if "全期間" in content: 
         return str(current_year), current_season_type, None, True, "全期間"
@@ -55,7 +54,6 @@ def parse_args(content, current_year, current_season_type):
     if year_match: 
         target_year = year_match.group(1)
         
-    # 「〇月」の指定があるかチェック
     month_match = re.search(r'([0-9]{1,2})月', content)
     if month_match:
         target_month = int(month_match.group(1))
@@ -68,10 +66,8 @@ def parse_args(content, current_year, current_season_type):
             break
     return target_year, target_season, None, False, f"{target_year}年 {target_season}"
 
-# ★グラフの「端っこ（表示期間）」を計算する関数（月指定にも対応）
 def get_graph_bounds(year_str, season_str, month_int):
     y = int(year_str)
-    # 月指定の場合：その月の1日から、翌月の1日までの1ヶ月枠
     if month_int:
         start = datetime(y, month_int, 1, 0, 0, tzinfo=JST)
         if month_int == 12:
@@ -80,7 +76,6 @@ def get_graph_bounds(year_str, season_str, month_int):
             end = datetime(y, month_int + 1, 1, 0, 0, tzinfo=JST)
         return start, end
     
-    # シーズン指定の場合：3ヶ月枠
     if season_str:
         if "春" in season_str:
             start = datetime(y, 3, 1, 0, 0, tzinfo=JST)
@@ -104,16 +99,39 @@ async def get_all_records():
     async for message in channel.history(limit=5000, oldest_first=True):
         if message.author == client.user:
             p = message.content.split('|')
-            if len(p) >= 6:
-                uid, uname, xp, t_str, season, msg_id = int(p[0]), p[1], int(p[2]), p[3], p[4], int(p[5])
+            
+            # 【重要修正】古いフォーマット(4要素)も新しいフォーマット(6要素)も両方読み込む！
+            if len(p) >= 4:
+                uid = int(p[0])
                 
+                if len(p) >= 6:
+                    # 最新データ
+                    uname = p[1]
+                    xp = int(p[2])
+                    t_str = p[3]
+                    season = p[4]
+                    msg_id = int(p[5])
+                else:
+                    # 昔のデータ（名前やメッセージIDが無い時代）
+                    uname = f"ID:{uid}"
+                    xp = int(p[1])
+                    t_str = p[2]
+                    season = p[3]
+                    msg_id = 0
+                
+                # 時間の変換
                 try: dt = datetime.strptime(t_str, '%Y/%m/%d %H:%M').replace(tzinfo=JST)
                 except ValueError:
                     try: dt = datetime.strptime(t_str, '%Y/%m/%d').replace(tzinfo=JST)
-                    except ValueError: dt = datetime.now(JST)
+                    except ValueError: dt = message.created_at.astimezone(JST) # 万が一時間がおかしければDiscordの投稿時間を使用
 
+                # データの格納
                 if uid not in data: data[uid] = {'name': uname, 'records': []}
-                data[uid]['name'] = uname
+                
+                # 最新のデータで「本当の名前」が分かれば、仮のID名から綺麗に上書きする
+                if uname != f"ID:{uid}":
+                    data[uid]['name'] = uname
+                    
                 data[uid]['records'].append({'xp': xp, 'time': dt, 'season': season, 'msg_id': msg_id})
     
     for uid in data:
@@ -123,7 +141,7 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} が月指定モードで起動しました！')
+    print(f'{client.user} が過去データ互換モードで起動しました！')
 
 @client.event
 async def on_message(message):
@@ -148,37 +166,46 @@ async def on_message(message):
             
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
-                await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d')}|{curr_season_full_str}|{message.id}")
+                await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{now.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 await message.channel.send(f"✅ {new_xp} XP を保存しました！")
 
         # 個人グラフ
         elif message.content.startswith('!グラフ'):
+            is_continuous = "通し" in message.content or "やった日から" in message.content
             ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
             if message.author.id not in all_d:
                 await message.channel.send("⚠️ データがありません。"); return
             
             recs = all_d[message.author.id]['records']
-            if not ia:
-                if tm: # 月指定フィルター
-                    recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
-                else: # シーズン指定フィルター
-                    recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+            
+            if not ia and not is_continuous:
+                if tm: recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
+                else: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
             
             if not recs:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
             
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', color='#1f77b4', linewidth=2, markersize=6)
+            fig, ax = plt.subplots(figsize=(12, 6))
             
-            if not ia:
-                start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
-                if start_bounds and end_bounds:
-                    ax.set_xlim(start_bounds, end_bounds)
+            if is_continuous:
+                indices = list(range(len(recs)))
+                xps = [r['xp'] for r in recs]
+                ax.plot(indices, xps, marker='o', color='#1f77b4', linewidth=1.5, markersize=5)
+                labels = [r['time'].strftime('%m/%d %H:%M') for r in recs]
+                plt.xticks(indices, labels, rotation=90, fontsize=9) 
+                ax.set_title(f"{message.author.display_name} さんの成長記録 (全記録 通し)", fontsize=15)
+            else:
+                ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', color='#1f77b4', linewidth=1.5, markersize=5)
+                
+                if not ia:
+                    start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
+                    if start_bounds and end_bounds: ax.set_xlim(start_bounds, end_bounds)
 
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-            plt.xticks(rotation=90, fontsize=10) 
-            ax.set_title(f"{message.author.display_name} さんの成長記録 ({title})", fontsize=15)
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+                plt.xticks(rotation=90, fontsize=9) 
+                ax.set_title(f"{message.author.display_name} さんの成長記録 ({title})", fontsize=15)
+            
             ax.grid(True, linestyle='--', alpha=0.6)
             plt.tight_layout()
             
@@ -187,33 +214,32 @@ async def on_message(message):
 
         # 全員のグラフ
         elif message.content.startswith('!全員のグラフ'):
+            is_continuous = "通し" in message.content or "やった日から" in message.content
             ty, ts, tm, ia, title = parse_args(message.content, now.year, current_season_type)
             all_d = await get_all_records()
-            fig, ax = plt.subplots(figsize=(10, 5))
+            fig, ax = plt.subplots(figsize=(12, 6))
             has_data = False
             
             for uid, info in all_d.items():
                 recs = info['records']
-                if not ia:
-                    if tm:
-                        recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
-                    else:
-                        recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+                if not ia and not is_continuous:
+                    if tm: recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
+                    else: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+                
                 if recs:
                     has_data = True
-                    ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', markersize=4, label=info['name'])
+                    ax.plot([r['time'] for r in recs], [r['xp'] for r in recs], marker='o', linewidth=1.5, markersize=4, label=info['name'])
             
             if not has_data:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
             
-            if not ia:
+            if not ia and not is_continuous:
                 start_bounds, end_bounds = get_graph_bounds(ty, ts, tm)
-                if start_bounds and end_bounds:
-                    ax.set_xlim(start_bounds, end_bounds)
+                if start_bounds and end_bounds: ax.set_xlim(start_bounds, end_bounds)
 
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-            plt.xticks(rotation=90, fontsize=10) 
-            ax.set_title(f"みんなのXP比較グラフ ({title})", fontsize=15)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+            plt.xticks(rotation=90, fontsize=9) 
+            ax.set_title(f"みんなのXP比較グラフ ({'やった日から全記録' if is_continuous else title})", fontsize=15)
             ax.grid(True, linestyle='--', alpha=0.6)
             ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
             plt.tight_layout()
@@ -229,10 +255,8 @@ async def on_message(message):
             for uid, info in all_d.items():
                 recs = info['records']
                 if not ia:
-                    if tm:
-                        recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
-                    else:
-                        recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
+                    if tm: recs = [r for r in recs if r['time'].year == int(ty) and r['time'].month == tm]
+                    else: recs = [r for r in recs if r['season'] == f"{ty}年 {ts}"]
                 if recs: ranking.append((info['name'], recs[-1]['xp']))
             if not ranking:
                 await message.channel.send(f"⚠️ {title} のデータがありません。"); return
@@ -304,9 +328,14 @@ async def on_raw_message_delete(payload):
     if payload.channel_id != TARGET_CHANNEL_ID: return
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if not log_channel: return
+    
+    # 昔のデータ（IDなし）も消せるように工夫
     async for m_log in log_channel.history(limit=100):
-        if m_log.author == client.user and m_log.content.endswith(f"|{payload.message_id}"):
-            await m_log.delete(); break
+        if m_log.author == client.user:
+            p = m_log.content.split('|')
+            if len(p) >= 6 and str(payload.message_id) == p[5]:
+                await m_log.delete()
+                break
 
 @client.event
 async def on_raw_message_edit(payload):
@@ -315,17 +344,19 @@ async def on_raw_message_edit(payload):
     content = payload.data.get('content')
     if not log_channel or not content: return
     match = re.search(r'xp\s*([0-9]+)|([0-9]+)\s*xp', content, re.IGNORECASE)
+    
     async for m_log in log_channel.history(limit=100):
-        if m_log.author == client.user and m_log.content.endswith(f"|{payload.message_id}"):
-            if match:
-                new_xp = int(match.group(1) or match.group(2))
-                if not (500 <= new_xp < 5000): return
-                
-                parts = m_log.content.split('|')
-                parts[2] = str(new_xp)
-                await m_log.edit(content="|".join(parts))
-            else: 
-                await m_log.delete()
-            break
+        if m_log.author == client.user:
+            p = m_log.content.split('|')
+            if len(p) >= 6 and str(payload.message_id) == p[5]:
+                if match:
+                    new_xp = int(match.group(1) or match.group(2))
+                    if not (500 <= new_xp < 5000): return
+                    
+                    p[2] = str(new_xp)
+                    await m_log.edit(content="|".join(p))
+                else: 
+                    await m_log.delete()
+                break
 
 client.run(TOKEN)
