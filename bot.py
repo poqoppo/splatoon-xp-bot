@@ -55,77 +55,73 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = XPClient(intents=intents)
 
+# 日本時間 (JST) の設定
 JST = timezone(timedelta(hours=+9), 'JST')
 
-# ★過去のエリアスケジュールを半永久的に記憶しておくためのキャッシュ
+# ─── ★最重要：APIから取得したエリアスケジュールを半永久的に溜めておくためのグローバルキャッシュ ───
 CACHED_AREA_SHIFTS = set()
 
-# ---------------------------------------------------------
-# ★新機能: 実際のXマッチ（ガチエリア）のスケジュールを2つのAPIから取得し記憶する
-# ---------------------------------------------------------
-async def get_real_area_time(now_dt):
+async def update_and_get_last_area_time(now_dt):
     global CACHED_AREA_SHIFTS
-    
-    # ① メインAPI (ブロック回避のため身分証を記載)
     try:
-        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/1.5 (Discord)'})
+        # スプラ3のスケジュールを提供する安定した国内API
+        req = urllib.request.Request("https://spla3.yuu26.com/api/x/schedule", headers={'User-Agent': 'XP-Bot/2.1'})
         res = await asyncio.to_thread(urllib.request.urlopen, req)
         data = json.loads(res.read().decode())
+        
+        # 取得できたエリア情報をすべてキャッシュに「都度保存（蓄積）」していく
         for node in data.get("results", []):
             if node.get("rule", {}).get("key") == "AREA":
                 st = datetime.fromisoformat(node["start_time"])
                 et = datetime.fromisoformat(node["end_time"])
+                
+                # タイムゾーンを日本時間に安全に補正
                 if st.tzinfo is None: st = st.replace(tzinfo=JST)
                 if et.tzinfo is None: et = et.replace(tzinfo=JST)
+                
+                # セット構造に保存（重複は自動で弾かれます）
                 CACHED_AREA_SHIFTS.add((st.astimezone(JST), et.astimezone(JST)))
     except Exception as e:
-        print(f"Primary API Error: {e}")
+        print(f"API Fetch Error: {e}")
         
-    # ② サブAPI (メインが落ちていた場合の予備ルート)
-    try:
-        req = urllib.request.Request("https://splatoon3.ink/data/schedules.json", headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        res = await asyncio.to_thread(urllib.request.urlopen, req)
-        data = json.loads(res.read().decode())
-        x_schedules = data.get("data", {}).get("xSchedules", {}).get("nodes", [])
-        for node in x_schedules:
-            if not node or not node.get("startTime"): continue
-            setting = node.get("xMatchSetting")
-            if not setting: continue
-            rule = setting.get("vsRule", {}).get("rule")
-            if rule == "AREA":
-                st = datetime.strptime(node["startTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
-                et = datetime.strptime(node["endTime"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(JST)
-                CACHED_AREA_SHIFTS.add((st, et))
-    except Exception as e2:
-        print(f"Secondary API Error: {e2}")
-
-    # 記憶(キャッシュ)の中から「現在時刻より前に始まった、最も新しいエリア」の終了時刻を探す
+    # 蓄積された過去すべての記憶（キャッシュ）の中から、
+    # 「開催が現在時刻以前に始まっていたもの」の中で、最も新しいエリアの終了時刻を特定する
+    best_et = None
     if CACHED_AREA_SHIFTS:
-        sorted_shifts = sorted(list(CACHED_AREA_SHIFTS), key=lambda x: x[0])
-        best_et = None
-        for st, et in sorted_shifts:
+        for st, et in CACHED_AREA_SHIFTS:
             if st <= now_dt:
-                best_et = et
-        if best_et:
-            return best_et
+                if best_et is None or et > best_et:
+                    best_et = et
+                    
+    return best_et
 
-    return None
-
-# 万が一APIが全滅し、かつ再起動直後で記憶が空っぽだった場合の最終防衛線（直近の奇数時間の終了時刻）
-def fallback_odd_hour(dt):
+# APIが全滅、かつ再起動直後でキャッシュが完全に空だった場合の最終保険（直前の奇数時間に丸める）
+def get_last_splat_end_time(dt):
     h = dt.hour
-    if h % 2 == 0: h -= 1
+    if h % 2 == 0: h -= 1 
     if h < 0:
         h = 23
         dt = dt - timedelta(days=1)
-    start_time = datetime(dt.year, dt.month, dt.day, h, 0, tzinfo=JST)
-    return start_time + timedelta(hours=2)
-# ---------------------------------------------------------
+    return dt.replace(hour=h, minute=0, second=0, microsecond=0)
+
+# 手動で「17:00」などと指定された時間をパースする関数
+def parse_specified_time(content, now_dt):
+    m1 = re.search(r'([0-9]{1,2}):([0-9]{2})', content)
+    if m1:
+        h, m = int(m1.group(1)), int(m1.group(2))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+            
+    m2 = re.search(r'([0-9]{1,2})時', content)
+    if m2:
+        h = int(m2.group(1))
+        if 0 <= h < 24:
+            return now_dt.replace(hour=h, minute=0, second=0, microsecond=0)
+    return None
 
 def parse_args_from_str(text, current_year, current_season_type):
     if not text: text = ""
     is_continuous = "通し" in text or "やった日から" in text
-    
     target_year = str(current_year)
     year_match = re.search(r'([0-9]{4})年', text)
     if year_match: target_year = year_match.group(1)
@@ -187,12 +183,12 @@ async def get_all_records():
 
 @client.event
 async def on_ready():
-    print(f'{client.user} がスケジュール記憶・完全同期モードで起動しました！')
+    print(f'{client.user} がスケジュール都度保存・完全同期モードで起動しました！')
 
 # ==================== スラッシュコマンド群 ====================
 
 @client.tree.command(name="グラフ", description="自分の成長グラフを生成します")
-@app_commands.describe(期間="例：「5月」「春シーズン」「通し」など（空欄で全期間）")
+@app_commands.describe(期間="例：「5月」「春シーズン」など（空欄で全期間表示）")
 async def graph(interaction: discord.Interaction, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
@@ -230,7 +226,7 @@ async def graph(interaction: discord.Interaction, 期間: str = None):
 
 
 @client.tree.command(name="比較グラフ", description="メンバー全員、または指定した人を重ねて比較します")
-@app_commands.describe(相手1="比較したい相手1", 相手2="比較したい相手2", 相手3="比較したい相手3", 期間="「5月」「通し」など（空欄で全員の全期間）")
+@app_commands.describe(相手1="比較したい相手1", 相手2="比較したい相手2", 相手3="比較したい相手3", 期間="「5月」など（空欄で全員表示）")
 async def comp_graph(interaction: discord.Interaction, 相手1: discord.Member = None, 相手2: discord.Member = None, 相手3: discord.Member = None, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
@@ -290,7 +286,6 @@ async def comp_graph(interaction: discord.Interaction, 相手1: discord.Member =
 
 
 @client.tree.command(name="ランキング", description="XPランキングを表示します")
-@app_commands.describe(期間="「5月」「春」など（空欄で全期間）")
 async def ranking(interaction: discord.Interaction, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
@@ -437,12 +432,19 @@ async def on_message(message):
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
                 
-                # ★修正: 取得したエリアのスケジュールを完璧に適用（記憶機能付き）
-                splat_time = await get_real_area_time(now)
+                # 1. ユーザーが手動で時間を指定した場合はそれを最優先
+                splat_time = parse_specified_time(message.content, now)
+                is_manual = True
                 
+                # 2. 指定がない場合、蓄積された履歴データから「直近過去のガチエリアの終了時刻」を安全に引っぱる！
                 if not splat_time:
-                    # APIが全滅で記憶もない場合の最終防衛線（直近の奇数時間の終了時刻に丸める）
-                    splat_time = fallback_odd_hour(now)
+                    splat_time = await update_and_get_last_area_time(now)
+                    is_manual = False
+                
+                # 3. 再起動直後などで記憶が空の場合は、最終防衛線（直前の奇数時間の終了時刻）を計算
+                if not splat_time:
+                    splat_time = get_last_splat_end_time(now)
+                    is_manual = False
                 
                 await log_channel.send(f"{message.author.id}|{message.author.display_name}|{new_xp}|{splat_time.strftime('%Y/%m/%d %H:%M')}|{curr_season_full_str}|{message.id}")
                 
@@ -495,7 +497,11 @@ async def on_message(message):
                     else:
                         drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！"
                 
-                await message.channel.send(f"✅ {new_xp} XP を保存しました！（記録枠：{splat_time.strftime('%m/%d %H:%M')}）{drama_msg}")
+                notice = f"（記録枠：{splat_time.strftime('%m/%d %H:%M')}）"
+                if not is_manual:
+                    notice += "\n💡 ※時間が違った場合は、自分のチャットを編集して『17:00』と書き足せば瞬時に修正されます！"
+                
+                await message.channel.send(f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}")
 
 @client.event
 async def on_raw_message_delete(payload):
@@ -522,8 +528,12 @@ async def on_raw_message_edit(payload):
             if len(p) >= 6 and str(payload.message_id) == p[5]:
                 if match:
                     new_xp = int(match.group(1) or match.group(2))
-                    if not (500 <= new_xp < 5000): return
                     p[2] = str(new_xp)
+                    
+                    spec_time = parse_specified_time(content, datetime.now(JST))
+                    if spec_time:
+                        p[3] = spec_time.strftime('%Y/%m/%d %H:%M')
+                    
                     await m_log.edit(content="|".join(p))
                 else:
                     await m_log.delete()
