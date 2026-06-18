@@ -1,3 +1,4 @@
+SYNC_COMMANDS=1
 import discord
 from discord import app_commands
 import asyncio, io, json, os, random, re, time, urllib.request
@@ -9,6 +10,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
+# XP Bot Stage2 Full + cleanup command
+# - 起動時の重い読み込みなし
+# - SYNC_COMMANDS=1 / SYNC_COMMADS=1 の時だけスラッシュコマンド同期
+# - 設定はログチャンネルに保存
+# - シーズン別アーカイブ
+# - アーカイブ済みログ掃除コマンド追加
+# - 個人グラフは全点・X軸ラベル全部表示
+# - 比較グラフは3人以下ならX軸ラベル全部表示、4人以上は間引き
 
 app = Flask(__name__)
 
@@ -43,7 +52,6 @@ if not TOKEN:
 TARGET_CHANNEL_ID = int(os.environ.get("TARGET_CHANNEL_ID", "1474973509217423401"))
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "1508739566138294522"))
 ARCHIVE_CHANNEL_ID = int(os.environ.get("ARCHIVE_CHANNEL_ID", "1510291838957912285"))
-
 ADMIN_USERS = ["poqoppo", "ricekei"]
 ADMIN_USER_IDS = [int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()]
 
@@ -63,29 +71,27 @@ ARCHIVE_SEASON_CACHE_SECONDS = int(os.environ.get("ARCHIVE_SEASON_CACHE_SECONDS"
 MAX_POINTS_PER_USER = int(os.environ.get("MAX_POINTS_PER_USER", "200"))
 MAX_XTICK_LABELS = int(os.environ.get("MAX_XTICK_LABELS", "30"))
 COMPARE_ALL_MAX_USERS = int(os.environ.get("COMPARE_ALL_MAX_USERS", "30"))
-
 JST = timezone(timedelta(hours=9), "JST")
 
 CACHED_AREA_SHIFTS = set()
 CACHED_AREA_DETAILS = []
 LAST_SCHEDULE_FETCH = None
 SCHEDULE_CACHE_SECONDS = 600
+LAST_ARCHIVE_CHECK = 0.0
 
 archive_lock = asyncio.Lock()
 cache_lock = asyncio.Lock()
-LAST_ARCHIVE_CHECK = 0.0
-
 CACHE_READY = False
-CACHE_BY_USER = {}       # uid -> {name, records}
-CACHE_BY_SOURCE = {}     # source message id -> rec
-CACHE_GOALS = {}         # uid -> season -> goal
-CACHE_GOAL_MSG = {}      # (uid, season) -> log message id
+CACHE_BY_USER = {}
+CACHE_BY_SOURCE = {}
+CACHE_GOALS = {}
+CACHE_GOAL_MSG = {}
 CACHE_SETTINGS_MSG = None
 
 ARCHIVE_INDEX_READY_AT = 0.0
-ARCHIVE_INDEX = {}       # season_name -> [attachment]
+ARCHIVE_INDEX = {}
 ARCHIVE_UNKNOWN_ATTACHMENTS = []
-ARCHIVE_SEASON_CACHE = {}  # season -> {time, records}
+ARCHIVE_SEASON_CACHE = {}
 ARCHIVE_ALL_CACHE = {"time": 0.0, "records": None}
 
 
@@ -106,7 +112,6 @@ intents.message_content = True
 client = XPClient(intents=intents)
 
 
-# ===== basic helpers =====
 def is_admin(user):
     if ADMIN_USER_IDS and user.id in ADMIN_USER_IDS:
         return True
@@ -138,16 +143,6 @@ def get_record_season_for_shift_end(end_time):
     return get_current_season(end_time - timedelta(seconds=1))
 
 
-def get_previous_season_pair(year, season_type):
-    if "春" in season_type:
-        return int(year) - 1, "冬シーズン"
-    if "夏" in season_type:
-        return int(year), "春シーズン"
-    if "秋" in season_type:
-        return int(year), "夏シーズン"
-    return int(year), "秋シーズン"
-
-
 def get_previous_season_for_award(dt):
     y = dt.year
     if dt.month == 3:
@@ -161,7 +156,7 @@ def get_previous_season_for_award(dt):
     return y, "不明シーズン"
 
 
-def get_graph_bounds(year_str, season_str, month_int=None):
+def get_graph_bounds(year_str, season_str=None, month_int=None):
     y = int(year_str)
     if month_int:
         start = datetime(y, month_int, 1, 0, 0, tzinfo=JST)
@@ -233,24 +228,20 @@ def parse_args_from_str(text, current_year, current_season_type, default_to_curr
         text = ""
     text = text.strip()
     is_continuous = "通し" in text or "やった日から" in text
-
     if text in ["全期間"]:
         return str(current_year), current_season_type, None, False, f"{current_year}年 {current_season_type}", is_continuous
     if text in ["全記録", "全シーズン", "すべて", "全部", "all", "ALL"]:
         return str(current_year), None, None, True, "全記録", is_continuous
-
     target_year = str(current_year)
     year_match = re.search(r"([0-9]{4})年", text)
     if year_match:
         target_year = year_match.group(1)
-
     month_match = re.search(r"([0-9]{1,2})月", text)
     season_match = None
     for s in ["春シーズン", "夏シーズン", "秋シーズン", "冬シーズン", "春", "夏", "秋", "冬"]:
         if s in text:
             season_match = s if "シーズン" in s else f"{s}シーズン"
             break
-
     if month_match:
         month = int(month_match.group(1))
         return target_year, None, month, False, f"{target_year}年 {month}月", is_continuous
@@ -282,7 +273,6 @@ def chunk_records(records, size):
         yield records[i:i + size]
 
 
-# ===== JSON parse/format =====
 def parse_api_datetime(value):
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
@@ -301,36 +291,15 @@ def parse_time_str(text, fallback_created_at=None):
 
 
 def make_record_json(user_id, user_name, xp, record_time, season, message_id):
-    return json.dumps({
-        "type": "xp_record",
-        "user_id": int(user_id),
-        "user_name": str(user_name),
-        "xp": int(xp),
-        "time": record_time.strftime("%Y/%m/%d %H:%M"),
-        "season": str(season),
-        "message_id": int(message_id),
-    }, ensure_ascii=False)
+    return json.dumps({"type": "xp_record", "user_id": int(user_id), "user_name": str(user_name), "xp": int(xp), "time": record_time.strftime("%Y/%m/%d %H:%M"), "season": str(season), "message_id": int(message_id)}, ensure_ascii=False)
 
 
 def make_goal_json(user_id, user_name, target_xp, season):
-    return json.dumps({
-        "type": "xp_goal",
-        "user_id": int(user_id),
-        "user_name": str(user_name),
-        "target_xp": int(target_xp),
-        "season": str(season),
-        "created_at": datetime.now(JST).strftime("%Y/%m/%d %H:%M"),
-        "active": True,
-    }, ensure_ascii=False)
+    return json.dumps({"type": "xp_goal", "user_id": int(user_id), "user_name": str(user_name), "target_xp": int(target_xp), "season": str(season), "created_at": datetime.now(JST).strftime("%Y/%m/%d %H:%M"), "active": True}, ensure_ascii=False)
 
 
 def make_settings_json(settings):
-    return json.dumps({
-        "type": "bot_settings",
-        "drama_enabled": bool(settings.get("drama_enabled", True)),
-        "area_notice_enabled": bool(settings.get("area_notice_enabled", True)),
-        "updated_at": datetime.now(JST).strftime("%Y/%m/%d %H:%M"),
-    }, ensure_ascii=False)
+    return json.dumps({"type": "bot_settings", "drama_enabled": bool(settings.get("drama_enabled", True)), "area_notice_enabled": bool(settings.get("area_notice_enabled", True)), "updated_at": datetime.now(JST).strftime("%Y/%m/%d %H:%M")}, ensure_ascii=False)
 
 
 def parse_log_record(content, fallback_created_at=None):
@@ -339,15 +308,7 @@ def parse_log_record(content, fallback_created_at=None):
         if obj.get("type") != "xp_record":
             return None
         uid = int(obj["user_id"])
-        return {
-            "user_id": uid,
-            "user_name": str(obj.get("user_name", f"ID:{uid}")),
-            "xp": int(obj["xp"]),
-            "time": parse_time_str(str(obj["time"]), fallback_created_at),
-            "season": str(obj["season"]),
-            "message_id": int(obj.get("message_id", 0)),
-            "raw_type": "json",
-        }
+        return {"user_id": uid, "user_name": str(obj.get("user_name", f"ID:{uid}")), "xp": int(obj["xp"]), "time": parse_time_str(str(obj["time"]), fallback_created_at), "season": str(obj["season"]), "message_id": int(obj.get("message_id", 0)), "raw_type": "json"}
     except Exception:
         pass
     try:
@@ -358,15 +319,7 @@ def parse_log_record(content, fallback_created_at=None):
                 uname, xp, t_str, season, msg_id = p[1], int(p[2]), p[3], p[4], int(p[5])
             else:
                 uname, xp, t_str, season, msg_id = f"ID:{uid}", int(p[1]), p[2], p[3], 0
-            return {
-                "user_id": uid,
-                "user_name": uname,
-                "xp": xp,
-                "time": parse_time_str(t_str, fallback_created_at),
-                "season": season,
-                "message_id": msg_id,
-                "raw_type": "pipe",
-            }
+            return {"user_id": uid, "user_name": uname, "xp": xp, "time": parse_time_str(t_str, fallback_created_at), "season": season, "message_id": msg_id, "raw_type": "pipe"}
     except Exception:
         return None
     return None
@@ -378,14 +331,7 @@ def parse_goal_record(content):
         if obj.get("type") != "xp_goal":
             return None
         uid = int(obj["user_id"])
-        return {
-            "user_id": uid,
-            "user_name": str(obj.get("user_name", f"ID:{uid}")),
-            "target_xp": int(obj["target_xp"]),
-            "season": str(obj["season"]),
-            "created_at": str(obj.get("created_at", "")),
-            "active": bool(obj.get("active", True)),
-        }
+        return {"user_id": uid, "user_name": str(obj.get("user_name", f"ID:{uid}")), "target_xp": int(obj["target_xp"]), "season": str(obj["season"]), "created_at": str(obj.get("created_at", "")), "active": bool(obj.get("active", True))}
     except Exception:
         return None
 
@@ -395,48 +341,21 @@ def parse_settings_record(content):
         obj = json.loads(content)
         if obj.get("type") != "bot_settings":
             return None
-        return {
-            "drama_enabled": bool(obj.get("drama_enabled", True)),
-            "area_notice_enabled": bool(obj.get("area_notice_enabled", True)),
-        }
+        return {"drama_enabled": bool(obj.get("drama_enabled", True)), "area_notice_enabled": bool(obj.get("area_notice_enabled", True))}
     except Exception:
         return None
 
 
 def record_to_log_content(record):
-    return json.dumps({
-        "type": "xp_record",
-        "user_id": int(record["user_id"]),
-        "user_name": str(record["user_name"]),
-        "xp": int(record["xp"]),
-        "time": record["time"].strftime("%Y/%m/%d %H:%M"),
-        "season": str(record["season"]),
-        "message_id": int(record.get("message_id", 0)),
-    }, ensure_ascii=False)
+    return make_record_json(record["user_id"], record["user_name"], record["xp"], record["time"], record["season"], record.get("message_id", 0))
 
 
 def goal_to_log_content(goal):
-    return json.dumps({
-        "type": "xp_goal",
-        "user_id": int(goal["user_id"]),
-        "user_name": str(goal["user_name"]),
-        "target_xp": int(goal["target_xp"]),
-        "season": str(goal["season"]),
-        "created_at": str(goal.get("created_at", "")),
-        "active": bool(goal.get("active", True)),
-    }, ensure_ascii=False)
+    return json.dumps({"type": "xp_goal", "user_id": int(goal["user_id"]), "user_name": str(goal["user_name"]), "target_xp": int(goal["target_xp"]), "season": str(goal["season"]), "created_at": str(goal.get("created_at", "")), "active": bool(goal.get("active", True))}, ensure_ascii=False)
 
 
 def record_to_archive_obj(record):
-    return {
-        "type": "xp_record",
-        "user_id": int(record["user_id"]),
-        "user_name": str(record["user_name"]),
-        "xp": int(record["xp"]),
-        "time": record["time"].strftime("%Y/%m/%d %H:%M"),
-        "season": str(record["season"]),
-        "message_id": int(record.get("message_id", 0)),
-    }
+    return {"type": "xp_record", "user_id": int(record["user_id"]), "user_name": str(record["user_name"]), "xp": int(record["xp"]), "time": record["time"].strftime("%Y/%m/%d %H:%M"), "season": str(record["season"]), "message_id": int(record.get("message_id", 0))}
 
 
 def parse_archive_record_obj(obj):
@@ -444,15 +363,7 @@ def parse_archive_record_obj(obj):
         if obj.get("type") != "xp_record":
             return None
         uid = int(obj["user_id"])
-        return {
-            "user_id": uid,
-            "user_name": str(obj.get("user_name", f"ID:{uid}")),
-            "xp": int(obj["xp"]),
-            "time": parse_time_str(str(obj["time"])),
-            "season": str(obj["season"]),
-            "message_id": int(obj.get("message_id", 0)),
-            "raw_type": "archive_json",
-        }
+        return {"user_id": uid, "user_name": str(obj.get("user_name", f"ID:{uid}")), "xp": int(obj["xp"]), "time": parse_time_str(str(obj["time"])), "season": str(obj["season"]), "message_id": int(obj.get("message_id", 0)), "raw_type": "archive_json"}
     except Exception:
         return None
 
@@ -464,7 +375,6 @@ def make_record_unique_key(record):
     return f"fallback:{record['user_id']}:{record['time'].strftime('%Y/%m/%d %H:%M')}:{record['xp']}:{record['season']}"
 
 
-# ===== schedule/time =====
 async def fetch_area_schedule(force=False):
     global CACHED_AREA_SHIFTS, CACHED_AREA_DETAILS, LAST_SCHEDULE_FETCH
     now = datetime.now(JST)
@@ -518,9 +428,7 @@ def get_last_splat_end_time(dt):
 
 
 def normalize_specified_time(candidate, now_dt):
-    if candidate > now_dt:
-        candidate -= timedelta(days=1)
-    return candidate
+    return candidate - timedelta(days=1) if candidate > now_dt else candidate
 
 
 def parse_specified_time(content, now_dt):
@@ -537,20 +445,9 @@ def parse_specified_time(content, now_dt):
     return None
 
 
-# ===== memory cache =====
 def _new_cache_rec(parsed, source, log_msg_id):
     src_id = int(parsed.get("message_id", 0))
-    return {
-        "user_id": int(parsed["user_id"]),
-        "user_name": str(parsed["user_name"]),
-        "xp": int(parsed["xp"]),
-        "time": parsed["time"],
-        "season": str(parsed["season"]),
-        "message_id": src_id,
-        "msg_id": src_id,
-        "_source": source,
-        "_log_msg_id": log_msg_id,
-    }
+    return {"user_id": int(parsed["user_id"]), "user_name": str(parsed["user_name"]), "xp": int(parsed["xp"]), "time": parsed["time"], "season": str(parsed["season"]), "message_id": src_id, "msg_id": src_id, "_source": source, "_log_msg_id": log_msg_id}
 
 
 def _cache_insert(rec):
@@ -651,7 +548,6 @@ async def _do_rebuild():
     BOT_SETTINGS.clear()
     BOT_SETTINGS.update(DEFAULT_SETTINGS)
     CACHE_SETTINGS_MSG = None
-
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         async for message in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT, oldest_first=True):
@@ -699,13 +595,11 @@ async def get_active_goal(user_id, season):
     return goal
 
 
-# ===== archive read/merge =====
 async def get_archive_index(force=False):
     global ARCHIVE_INDEX_READY_AT, ARCHIVE_INDEX, ARCHIVE_UNKNOWN_ATTACHMENTS
     now_mono = time.monotonic()
     if not force and ARCHIVE_INDEX_READY_AT and now_mono - ARCHIVE_INDEX_READY_AT < ARCHIVE_INDEX_CACHE_SECONDS:
         return ARCHIVE_INDEX, ARCHIVE_UNKNOWN_ATTACHMENTS
-
     channel = client.get_channel(ARCHIVE_CHANNEL_ID)
     index = {}
     unknown = []
@@ -752,7 +646,6 @@ async def get_archive_records_for_seasons(seasons, include_unknown=True):
     seasons = list(dict.fromkeys(seasons or []))
     if not seasons:
         return []
-
     now_mono = time.monotonic()
     out = []
     missing = []
@@ -764,7 +657,6 @@ async def get_archive_records_for_seasons(seasons, include_unknown=True):
             missing.append(s)
     if not missing:
         return out
-
     index, unknown = await get_archive_index()
     for s in missing:
         recs = []
@@ -815,16 +707,7 @@ def build_data_from_records(records):
             data[uid] = {"name": uname, "records": []}
         if uname != f"ID:{uid}":
             data[uid]["name"] = uname
-        data[uid]["records"].append({
-            "user_id": uid,
-            "user_name": uname,
-            "xp": int(record["xp"]),
-            "time": record["time"],
-            "season": str(record["season"]),
-            "message_id": int(record.get("message_id", 0)),
-            "msg_id": int(record.get("message_id", 0)),
-            "_source": record.get("_source", record.get("raw_type", "merged")),
-        })
+        data[uid]["records"].append({"user_id": uid, "user_name": uname, "xp": int(record["xp"]), "time": record["time"], "season": str(record["season"]), "message_id": int(record.get("message_id", 0)), "msg_id": int(record.get("message_id", 0)), "_source": record.get("_source", record.get("raw_type", "merged"))})
     for uid in data:
         data[uid]["records"].sort(key=lambda x: x["time"])
     return data
@@ -852,6 +735,26 @@ async def get_all_records():
     return build_data_from_records(current_cache_records_as_parsed() + await get_all_archive_records())
 
 
+async def get_archive_records_for_cleanup(period_text=None):
+    now = datetime.now(JST)
+    cy, cs = get_current_season(now)
+    if not period_text:
+        records = await get_all_archive_records()
+        return records, "全アーカイブ"
+    ty, ts, tm, ia, title, is_continuous = parse_args_from_str(period_text, cy, cs, False)
+    if ia or is_continuous:
+        records = await get_all_archive_records()
+    elif tm:
+        records = await get_archive_records_for_seasons(get_candidate_seasons_for_month(ty, tm))
+        records = [r for r in records if is_record_in_period(r["time"], ty, None, tm)]
+    elif ts:
+        records = await get_archive_records_for_seasons([season_full(ty, ts)])
+        records = [r for r in records if is_record_in_period(r["time"], ty, ts, None)]
+    else:
+        records = await get_all_archive_records()
+    return records, title
+
+
 async def auto_archive_if_needed(force=False):
     global LAST_ARCHIVE_CHECK, ARCHIVE_INDEX_READY_AT
     async with archive_lock:
@@ -861,16 +764,13 @@ async def auto_archive_if_needed(force=False):
         if not force and now_mono - LAST_ARCHIVE_CHECK < ARCHIVE_CHECK_INTERVAL_SECONDS:
             return False, 0, "次回チェック待ちです"
         LAST_ARCHIVE_CHECK = now_mono
-
         archive_channel = client.get_channel(ARCHIVE_CHANNEL_ID)
         log_channel = client.get_channel(LOG_CHANNEL_ID)
         if not archive_channel or not log_channel:
             return False, 0, "チャンネルが見つかりません"
-
         log_records = list(_cache_all_log_records())
         if not log_records:
             return False, 0, "アーカイブ対象がありません"
-
         current_count, _ = _count_cache_records()
         if force:
             candidates = log_records
@@ -878,57 +778,34 @@ async def auto_archive_if_needed(force=False):
             candidates = [r for r in log_records if is_archive_eligible_season(r.get("season", ""), now)]
             if current_count < ARCHIVE_THRESHOLD and not candidates:
                 return False, current_count, "アーカイブ条件未達です"
-
         if not candidates:
             return False, current_count, "アーカイブ可能な過去シーズンがありません"
-
         grouped = {}
         for rec in candidates:
             grouped.setdefault(rec.get("season", "不明シーズン"), []).append(rec)
-
         archived_records = []
         warnings = []
         for season_name, recs in grouped.items():
             recs.sort(key=lambda x: x["time"])
-            archive_objs = [record_to_archive_obj(r) for r in recs]
-            chunks = list(chunk_records(archive_objs, ARCHIVE_MAX_RECORDS_PER_FILE))
+            chunks = list(chunk_records([record_to_archive_obj(r) for r in recs], ARCHIVE_MAX_RECORDS_PER_FILE))
             if len(chunks) > ARCHIVE_MAX_PARTS_PER_SEASON:
                 warnings.append(f"{season_name} が {len(recs)}件あり、最大{ARCHIVE_MAX_RECORDS_PER_FILE * ARCHIVE_MAX_PARTS_PER_SEASON}件を超えました。先頭分のみアーカイブします。")
                 chunks = chunks[:ARCHIVE_MAX_PARTS_PER_SEASON]
-
             safe_season = safe_archive_filename_part(season_name)
             max_parts = min(len(chunks), ARCHIVE_MAX_PARTS_PER_SEASON)
             archived_count_for_season = 0
             for part_index, chunk in enumerate(chunks, start=1):
-                archive_obj = {
-                    "type": "xp_archive",
-                    "archive_unit": "season",
-                    "season": season_name,
-                    "part": part_index,
-                    "max_parts": ARCHIVE_MAX_PARTS_PER_SEASON,
-                    "created_at": now.strftime("%Y/%m/%d %H:%M:%S"),
-                    "record_count": len(chunk),
-                    "records": chunk,
-                }
+                archive_obj = {"type": "xp_archive", "archive_unit": "season", "season": season_name, "part": part_index, "max_parts": ARCHIVE_MAX_PARTS_PER_SEASON, "created_at": now.strftime("%Y/%m/%d %H:%M:%S"), "record_count": len(chunk), "records": chunk}
                 file_obj = io.BytesIO(json.dumps(archive_obj, ensure_ascii=False, indent=2).encode("utf-8"))
                 fname = f"xp_archive_{safe_season}_part{part_index}_{now.strftime('%Y%m%d_%H%M%S')}_{len(chunk)}records.json"
                 try:
-                    await archive_channel.send(
-                        content=(
-                            f"📦 **XPログ シーズン別アーカイブ**\n"
-                            f"シーズン：**{season_name}**\n"
-                            f"Part：**{part_index}/{max_parts}**\n"
-                            f"件数：**{len(chunk)}件**\n"
-                            f"作成日時：**{now.strftime('%Y/%m/%d %H:%M:%S')}**"
-                        ),
-                        file=discord.File(file_obj, filename=fname),
-                    )
+                    await archive_channel.send(content=f"📦 **XPログ シーズン別アーカイブ**\nシーズン：**{season_name}**\nPart：**{part_index}/{max_parts}**\n件数：**{len(chunk)}件**\n作成日時：**{now.strftime('%Y/%m/%d %H:%M:%S')}**", file=discord.File(file_obj, filename=fname))
                     archived_count_for_season += len(chunk)
                 except Exception as e:
                     return False, len(archived_records), f"アーカイブ送信失敗: {e}"
             archived_records.extend(recs[:archived_count_for_season])
-
         deleted_count = 0
+        failed_count = 0
         for rec in archived_records:
             try:
                 await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
@@ -936,21 +813,21 @@ async def auto_archive_if_needed(force=False):
                 _cache_mark_archived(rec)
                 await asyncio.sleep(DELETE_SLEEP_SECONDS)
             except Exception as e:
+                failed_count += 1
                 print(f"Archive delete error: {e}")
-
         ARCHIVE_INDEX_READY_AT = 0.0
         ARCHIVE_ALL_CACHE["time"] = 0.0
         ARCHIVE_ALL_CACHE["records"] = None
         for season_name in grouped:
             ARCHIVE_SEASON_CACHE.pop(season_name, None)
-
         msg = "アーカイブ完了"
+        if failed_count:
+            msg += f"。ただし {failed_count}件のログ削除に失敗しました。/アーカイブ済みログ掃除 を実行してください。"
         if warnings:
             msg += "（警告あり）: " + " / ".join(warnings)
         return True, deleted_count, msg
 
 
-# ===== graph/display helpers =====
 def thin_records_for_plot(recs, max_points=MAX_POINTS_PER_USER):
     if len(recs) <= max_points:
         return recs
@@ -975,11 +852,7 @@ def set_limited_xticks(ax, indices, labels, force_all=False):
 
 def build_power_change_message(old_xp, new_xp):
     if old_xp is None:
-        return random.choice([
-            "\n🆕 **初記録！** ここから伝説、始めちゃいますか！",
-            "\n🦑 **初陣記録！** まずはここがスタートライン。次は上を見よう！",
-            "\n📌 **初登録完了！** 成長の始まりです。",
-        ])
+        return random.choice(["\n🆕 **初記録！** ここから伝説、始めちゃいますか！", "\n🦑 **初陣記録！** まずはここがスタートライン。", "\n📌 **初登録完了！** 成長の始まりです。"]) 
     diff = new_xp - old_xp
     if diff > 0:
         if diff >= 100:
@@ -999,7 +872,6 @@ def build_power_change_message(old_xp, new_xp):
     return random.choice([f"\n🤏 **微減！** **-{drop} XP**。", f"\n😌 **軽傷！** **-{drop} XP**。"])
 
 
-# ===== events and commands =====
 @client.event
 async def on_ready():
     print(f"{client.user} が起動しました！（キャッシュは初回アクセス時に遅延ロード）")
@@ -1016,29 +888,19 @@ async def notification_settings(interaction: discord.Interaction, 煽り文章: 
     async with cache_lock:
         changed = False
         if 煽り文章 is not None:
-            BOT_SETTINGS["drama_enabled"] = 煽り文章
-            changed = True
+            BOT_SETTINGS["drama_enabled"] = 煽り文章; changed = True
         if エリア通知 is not None:
-            BOT_SETTINGS["area_notice_enabled"] = エリア通知
-            changed = True
+            BOT_SETTINGS["area_notice_enabled"] = エリア通知; changed = True
         if changed:
             await _persist_settings()
-    await interaction.followup.send(
-        f"⚙️ **現在の通知設定**\n"
-        f"煽り文章：**{'ON' if BOT_SETTINGS.get('drama_enabled', True) else 'OFF'}**\n"
-        f"次のガチエリア表示：**{'ON' if BOT_SETTINGS.get('area_notice_enabled', True) else 'OFF'}**"
-    )
+    await interaction.followup.send(f"⚙️ **現在の通知設定**\n煽り文章：**{'ON' if BOT_SETTINGS.get('drama_enabled', True) else 'OFF'}**\n次のガチエリア表示：**{'ON' if BOT_SETTINGS.get('area_notice_enabled', True) else 'OFF'}**")
 
 
 @client.tree.command(name="設定確認", description="現在のBot設定を確認します")
 async def show_settings(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await ensure_cache()
-    await interaction.followup.send(
-        f"⚙️ **現在の通知設定**\n"
-        f"煽り文章：**{'ON' if BOT_SETTINGS.get('drama_enabled', True) else 'OFF'}**\n"
-        f"次のガチエリア表示：**{'ON' if BOT_SETTINGS.get('area_notice_enabled', True) else 'OFF'}**"
-    )
+    await interaction.followup.send(f"⚙️ **現在の通知設定**\n煽り文章：**{'ON' if BOT_SETTINGS.get('drama_enabled', True) else 'OFF'}**\n次のガチエリア表示：**{'ON' if BOT_SETTINGS.get('area_notice_enabled', True) else 'OFF'}**")
 
 
 @client.tree.command(name="ログ件数", description="現在ログと読み込み済みアーカイブの件数を確認します")
@@ -1046,13 +908,7 @@ async def log_count(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await ensure_cache()
     current, archived_loaded = _count_cache_records()
-    await interaction.followup.send(
-        f"📊 **XPログ件数**\n"
-        f"現在ログチャンネル：**{current}件**\n"
-        f"メモリ上のアーカイブ化済み記録：**{archived_loaded}件**\n"
-        f"自動アーカイブしきい値：**{ARCHIVE_THRESHOLD}件**\n"
-        f"※過去アーカイブJSONは必要時だけ読み込みます。"
-    )
+    await interaction.followup.send(f"📊 **XPログ件数**\n現在ログチャンネル：**{current}件**\nメモリ上のアーカイブ化済み記録：**{archived_loaded}件**\n自動アーカイブしきい値：**{ARCHIVE_THRESHOLD}件**\n※過去アーカイブJSONは必要時だけ読み込みます。")
 
 
 @client.tree.command(name="再読み込み", description="【管理者専用】現在ログ・目標・設定のキャッシュを作り直します")
@@ -1074,11 +930,8 @@ async def reload_all_cache(interaction: discord.Interaction):
         return
     global ARCHIVE_INDEX_READY_AT
     ARCHIVE_INDEX_READY_AT = 0.0
-    ARCHIVE_INDEX.clear()
-    ARCHIVE_UNKNOWN_ATTACHMENTS.clear()
-    ARCHIVE_SEASON_CACHE.clear()
-    ARCHIVE_ALL_CACHE["time"] = 0.0
-    ARCHIVE_ALL_CACHE["records"] = None
+    ARCHIVE_INDEX.clear(); ARCHIVE_UNKNOWN_ATTACHMENTS.clear(); ARCHIVE_SEASON_CACHE.clear()
+    ARCHIVE_ALL_CACHE["time"] = 0.0; ARCHIVE_ALL_CACHE["records"] = None
     await rebuild_cache()
     await interaction.followup.send("🔄 全キャッシュをクリアして、現在ログを再読み込みしました。")
 
@@ -1094,10 +947,46 @@ async def manual_archive(interaction: discord.Interaction, 確認: str):
         await interaction.followup.send("⚠️ 確認文字列が違います。実行するには `ARCHIVE` と入力してください。")
         return
     success, count, msg = await auto_archive_if_needed(force=True)
-    if success:
-        await interaction.followup.send(f"📦 手動アーカイブ完了：**{count}件** をシーズン別に保存して現在ログから削除しました。\n{msg}")
-    else:
-        await interaction.followup.send(f"⚠️ 手動アーカイブ失敗/未実行：{msg}（対象 {count}件）")
+    await interaction.followup.send(f"📦 手動アーカイブ完了：**{count}件** をシーズン別に保存して現在ログから削除しました。\n{msg}" if success else f"⚠️ 手動アーカイブ失敗/未実行：{msg}（対象 {count}件）")
+
+
+@client.tree.command(name="アーカイブ済みログ掃除", description="【管理者専用】アーカイブ済みなのに現在ログに残った記録だけ削除します")
+@app_commands.describe(確認="実行する場合は CLEAN と入力", 期間="任意。例：春シーズン、2026年 春シーズン、5月。空欄なら全アーカイブ照合")
+async def cleanup_archived_logs(interaction: discord.Interaction, 確認: str, 期間: str = None):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin(interaction.user):
+        await interaction.followup.send("⚠️ このコマンドは管理者専用です。")
+        return
+    if 確認 != "CLEAN":
+        await interaction.followup.send("⚠️ 実行するには `CLEAN` と入力してください。")
+        return
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
+        await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
+        return
+    await ensure_cache()
+    archive_records, title = await get_archive_records_for_cleanup(期間)
+    archived_keys = set(make_record_unique_key(r) for r in archive_records)
+    if not archived_keys:
+        await interaction.followup.send(f"⚠️ {title} のアーカイブ記録が見つかりませんでした。")
+        return
+    deleted_count = 0
+    failed_count = 0
+    checked_count = 0
+    async with cache_lock:
+        for rec in list(_cache_all_log_records()):
+            checked_count += 1
+            if make_record_unique_key(rec) not in archived_keys:
+                continue
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
+                deleted_count += 1
+                _cache_mark_archived(rec)
+                await asyncio.sleep(DELETE_SLEEP_SECONDS)
+            except Exception as e:
+                failed_count += 1
+                print(f"Archived log cleanup delete error: {e}")
+    await interaction.followup.send(f"🧹 **アーカイブ済みログ掃除完了**\n照合範囲：**{title}**\n現在ログ確認：**{checked_count}件**\n削除：**{deleted_count}件**\n失敗：**{failed_count}件**")
 
 
 @client.tree.command(name="目標設定", description="現シーズンの目標XPを設定します")
@@ -1108,8 +997,8 @@ async def set_goal(interaction: discord.Interaction, 目標xp: int):
         await interaction.followup.send("⚠️ 目標XPは500〜5000で入力してください！")
         return
     now = datetime.now(JST)
-    season_year, season_type = get_current_season(now)
-    season_name = season_full(season_year, season_type)
+    sy, st = get_current_season(now)
+    sname = season_full(sy, st)
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
@@ -1117,58 +1006,51 @@ async def set_goal(interaction: discord.Interaction, 目標xp: int):
     await ensure_cache()
     current_xp = None
     async with cache_lock:
-        old_goal = CACHE_GOALS.get(interaction.user.id, {}).get(season_name)
-        old_msg_id = CACHE_GOAL_MSG.get((interaction.user.id, season_name))
+        old_goal = CACHE_GOALS.get(interaction.user.id, {}).get(sname)
+        old_msg_id = CACHE_GOAL_MSG.get((interaction.user.id, sname))
         if old_goal and old_goal.get("active", True) and old_msg_id:
             old_goal["active"] = False
             try:
                 await log_channel.get_partial_message(old_msg_id).edit(content=goal_to_log_content(old_goal))
             except Exception:
                 pass
-        sent = await log_channel.send(make_goal_json(interaction.user.id, interaction.user.display_name, 目標xp, season_name))
-        new_goal = {"user_id": interaction.user.id, "user_name": interaction.user.display_name, "target_xp": 目標xp, "season": season_name, "created_at": now.strftime("%Y/%m/%d %H:%M"), "active": True}
-        _cache_set_goal(new_goal, sent.id)
+        sent = await log_channel.send(make_goal_json(interaction.user.id, interaction.user.display_name, 目標xp, sname))
+        _cache_set_goal({"user_id": interaction.user.id, "user_name": interaction.user.display_name, "target_xp": 目標xp, "season": sname, "created_at": now.strftime("%Y/%m/%d %H:%M"), "active": True}, sent.id)
         info = CACHE_BY_USER.get(interaction.user.id)
         if info:
-            recs = [r for r in info["records"] if is_record_in_period(r["time"], str(season_year), season_type, None)]
+            recs = [r for r in info["records"] if is_record_in_period(r["time"], str(sy), st, None)]
             if recs:
                 current_xp = recs[-1]["xp"]
     if current_xp is None:
-        await interaction.followup.send(f"🎯 **{season_name} の目標を設定しました！**\n目標：**{目標xp} XP**\nまだ今シーズンの記録がないので、まずは1回記録しましょう！")
-        return
-    diff = 目標xp - current_xp
-    await interaction.followup.send(
-        f"🎯 **{season_name} の目標を設定しました！**\n目標：**{目標xp} XP**\n現在：**{current_xp} XP**\n"
-        + ("✅ もう目標達成済みです。目標、低すぎません？😎" if diff <= 0 else f"あと **{diff} XP**！")
-    )
+        await interaction.followup.send(f"🎯 **{sname} の目標を設定しました！**\n目標：**{目標xp} XP**\nまだ今シーズンの記録がないので、まずは1回記録しましょう！")
+    else:
+        diff = 目標xp - current_xp
+        await interaction.followup.send(f"🎯 **{sname} の目標を設定しました！**\n目標：**{目標xp} XP**\n現在：**{current_xp} XP**\n" + ("✅ もう目標達成済みです。" if diff <= 0 else f"あと **{diff} XP**！"))
 
 
 @client.tree.command(name="目標確認", description="現シーズンの目標XPと達成状況を確認します")
 async def check_goal(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     now = datetime.now(JST)
-    season_year, season_type = get_current_season(now)
-    season_name = season_full(season_year, season_type)
-    goal = await get_active_goal(interaction.user.id, season_name)
+    sy, st = get_current_season(now)
+    sname = season_full(sy, st)
+    goal = await get_active_goal(interaction.user.id, sname)
     if not goal:
-        await interaction.followup.send(f"⚠️ **{season_name}** の目標がまだ設定されていません。\n`/目標設定` で目標XPを設定できます。")
+        await interaction.followup.send(f"⚠️ **{sname}** の目標がまだ設定されていません。\n`/目標設定` で目標XPを設定できます。")
         return
-    all_d = await get_records_for_period(str(season_year), season_type, None, False)
+    all_d = await get_records_for_period(str(sy), st, None, False)
     current_xp = best_xp = None
     if interaction.user.id in all_d:
-        recs = [r for r in all_d[interaction.user.id]["records"] if is_record_in_period(r["time"], str(season_year), season_type, None)]
+        recs = [r for r in all_d[interaction.user.id]["records"] if is_record_in_period(r["time"], str(sy), st, None)]
         if recs:
             current_xp = recs[-1]["xp"]
             best_xp = max(r["xp"] for r in recs)
     target_xp = goal["target_xp"]
     if current_xp is None:
-        await interaction.followup.send(f"🎯 **{season_name} の目標**\n目標：**{target_xp} XP**\n現在：記録なし\nまずはXPを記録しましょう！")
-        return
-    diff = target_xp - current_xp
-    await interaction.followup.send(
-        f"🎯 **{season_name} の目標**\n目標：**{target_xp} XP**\n現在：**{current_xp} XP**\n今シーズン最高：**{best_xp} XP**\n"
-        + ("✅ **目標達成済み！** 次はもっと高く設定して自分を追い込みましょう😎" if diff <= 0 else f"あと **{diff} XP**！")
-    )
+        await interaction.followup.send(f"🎯 **{sname} の目標**\n目標：**{target_xp} XP**\n現在：記録なし")
+    else:
+        diff = target_xp - current_xp
+        await interaction.followup.send(f"🎯 **{sname} の目標**\n目標：**{target_xp} XP**\n現在：**{current_xp} XP**\n今シーズン最高：**{best_xp} XP**\n" + ("✅ **目標達成済み！**" if diff <= 0 else f"あと **{diff} XP**！"))
 
 
 @client.tree.command(name="目標削除", description="現シーズンの目標XPを削除します")
@@ -1179,8 +1061,8 @@ async def delete_goal(interaction: discord.Interaction, 確認: str):
         await interaction.followup.send("⚠️ 目標を削除するには `DELETE` と入力してください。")
         return
     now = datetime.now(JST)
-    season_year, season_type = get_current_season(now)
-    season_name = season_full(season_year, season_type)
+    sy, st = get_current_season(now)
+    sname = season_full(sy, st)
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
@@ -1188,31 +1070,31 @@ async def delete_goal(interaction: discord.Interaction, 確認: str):
     await ensure_cache()
     deleted = False
     async with cache_lock:
-        msg_id = CACHE_GOAL_MSG.get((interaction.user.id, season_name))
-        goal = CACHE_GOALS.get(interaction.user.id, {}).get(season_name)
+        msg_id = CACHE_GOAL_MSG.get((interaction.user.id, sname))
+        goal = CACHE_GOALS.get(interaction.user.id, {}).get(sname)
         if msg_id and goal and goal.get("active", True):
             try:
                 await log_channel.get_partial_message(msg_id).delete()
             except Exception:
                 pass
-            _cache_remove_goal(interaction.user.id, season_name)
+            _cache_remove_goal(interaction.user.id, sname)
             deleted = True
-    await interaction.followup.send(f"🗑️ **{season_name}** の目標を削除しました。" if deleted else f"⚠️ **{season_name}** の有効な目標が見つかりませんでした。")
+    await interaction.followup.send(f"🗑️ **{sname}** の目標を削除しました。" if deleted else f"⚠️ **{sname}** の有効な目標が見つかりませんでした。")
 
 
 @client.tree.command(name="自己ベスト", description="自分の最高XPを表示します")
-@app_commands.describe(期間="例：「夏シーズン」「5月」「全期間」「全記録」など（空欄で現シーズン表示）")
+@app_commands.describe(期間="例：「夏シーズン」「5月」「全期間」「全記録」など")
 async def personal_best(interaction: discord.Interaction, 期間: str = None):
     await interaction.response.defer(ephemeral=True)
     now = datetime.now(JST)
-    season_year, current_season_type = get_current_season(now)
-    ty, ts, tm, ia, title, is_continuous = parse_args_from_str(期間, season_year, current_season_type, True)
-    all_d = await get_records_for_period(ty, ts, tm, ia, is_continuous)
+    sy, st = get_current_season(now)
+    ty, ts, tm, ia, title, cont = parse_args_from_str(期間, sy, st, True)
+    all_d = await get_records_for_period(ty, ts, tm, ia, cont)
     if interaction.user.id not in all_d:
         await interaction.followup.send("⚠️ データがありません。")
         return
     recs = all_d[interaction.user.id]["records"]
-    if not ia and not is_continuous:
+    if not ia and not cont:
         recs = [r for r in recs if is_record_in_period(r["time"], ty, ts, tm)]
     if not recs:
         await interaction.followup.send(f"⚠️ {title} のデータがありません。")
@@ -1222,17 +1104,17 @@ async def personal_best(interaction: discord.Interaction, 期間: str = None):
 
 
 @client.tree.command(name="伸びランキング", description="指定期間でXPが伸びた人ランキングを表示します")
-@app_commands.describe(期間="例：「夏シーズン」「5月」「全期間」「全記録」など（空欄で現シーズン表示）")
+@app_commands.describe(期間="例：「夏シーズン」「5月」「全期間」「全記録」など")
 async def growth_ranking(interaction: discord.Interaction, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
-    season_year, current_season_type = get_current_season(now)
-    ty, ts, tm, ia, title, is_continuous = parse_args_from_str(期間, season_year, current_season_type, True)
-    all_d = await get_records_for_period(ty, ts, tm, ia, is_continuous)
+    sy, st = get_current_season(now)
+    ty, ts, tm, ia, title, cont = parse_args_from_str(期間, sy, st, True)
+    all_d = await get_records_for_period(ty, ts, tm, ia, cont)
     growth_list = []
     for uid, info in all_d.items():
         recs = info["records"]
-        if not ia and not is_continuous:
+        if not ia and not cont:
             recs = [r for r in recs if is_record_in_period(r["time"], ty, ts, tm)]
         if len(recs) >= 2:
             growth_list.append((info["name"], recs[-1]["xp"] - recs[0]["xp"], recs[0]["xp"], recs[-1]["xp"], len(recs)))
@@ -1251,24 +1133,22 @@ async def growth_ranking(interaction: discord.Interaction, 期間: str = None):
 
 
 @client.tree.command(name="グラフ", description="自分の成長グラフを生成します")
-@app_commands.describe(期間="例：「5月」「夏シーズン」「全期間」「全記録」など（空欄で現シーズン表示）")
+@app_commands.describe(期間="例：「5月」「夏シーズン」「全期間」「全記録」など")
 async def graph(interaction: discord.Interaction, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
-    season_year, current_season_type = get_current_season(now)
-    ty, ts, tm, ia, title, is_continuous = parse_args_from_str(期間, season_year, current_season_type, True)
-    all_d = await get_records_for_period(ty, ts, tm, ia, is_continuous)
+    sy, st = get_current_season(now)
+    ty, ts, tm, ia, title, cont = parse_args_from_str(期間, sy, st, True)
+    all_d = await get_records_for_period(ty, ts, tm, ia, cont)
     if interaction.user.id not in all_d:
         await interaction.followup.send("⚠️ データがありません。")
         return
     recs = all_d[interaction.user.id]["records"]
-    if not ia and not is_continuous:
+    if not ia and not cont:
         recs = [r for r in recs if is_record_in_period(r["time"], ty, ts, tm)]
     if not recs:
         await interaction.followup.send(f"⚠️ {title} のデータがありません。")
         return
-
-    # 個人グラフは全点表示・X軸ラベルも全部表示
     plot_recs = recs
     fig, ax = plt.subplots(figsize=(12, 6))
     indices = list(range(len(plot_recs)))
@@ -1290,14 +1170,13 @@ async def graph(interaction: discord.Interaction, 期間: str = None):
 
 
 @client.tree.command(name="比較グラフ", description="メンバー全員、または指定した人を重ねて比較します")
-@app_commands.describe(相手1="比較したい相手1", 相手2="比較したい相手2", 相手3="比較したい相手3", 期間="例：「5月」「夏シーズン」「全期間」「全記録」など（空欄で現シーズン表示）")
+@app_commands.describe(相手1="比較したい相手1", 相手2="比較したい相手2", 相手3="比較したい相手3", 期間="例：「5月」「夏シーズン」「全期間」「全記録」など")
 async def comp_graph(interaction: discord.Interaction, 相手1: discord.Member = None, 相手2: discord.Member = None, 相手3: discord.Member = None, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
-    season_year, current_season_type = get_current_season(now)
-    ty, ts, tm, ia, title, is_continuous = parse_args_from_str(期間, season_year, current_season_type, True)
-    all_d = await get_records_for_period(ty, ts, tm, ia, is_continuous)
-
+    sy, st = get_current_season(now)
+    ty, ts, tm, ia, title, cont = parse_args_from_str(期間, sy, st, True)
+    all_d = await get_records_for_period(ty, ts, tm, ia, cont)
     targets = [interaction.user.id]
     if 相手1:
         targets.append(相手1.id)
@@ -1306,42 +1185,33 @@ async def comp_graph(interaction: discord.Interaction, 相手1: discord.Member =
     if 相手3:
         targets.append(相手3.id)
     targets = list(dict.fromkeys(targets))
-
     is_all_compare = len(targets) == 1
     target_ids = list(all_d.keys()) if is_all_compare else targets
     plot_data = []
-
     for uid in target_ids:
         if uid not in all_d:
             continue
         recs = all_d[uid]["records"]
-        if not ia and not is_continuous:
+        if not ia and not cont:
             recs = [r for r in recs if is_record_in_period(r["time"], ty, ts, tm)]
         if recs:
             plot_data.append((all_d[uid]["name"], recs))
-
     omitted_msg = ""
     if is_all_compare and len(plot_data) > COMPARE_ALL_MAX_USERS:
         plot_data.sort(key=lambda x: x[1][-1]["xp"], reverse=True)
         omitted = len(plot_data) - COMPARE_ALL_MAX_USERS
         plot_data = plot_data[:COMPARE_ALL_MAX_USERS]
         omitted_msg = f"\n⚠️ 全員比較対象が多いため、最新XP上位{COMPARE_ALL_MAX_USERS}人のみ表示しています（省略 {omitted}人）。"
-
     if not plot_data:
         await interaction.followup.send("⚠️ 比較するデータがありません。")
         return
-
     plot_data = [(name, thin_records_for_plot(recs)) for name, recs in plot_data]
     fig, ax = plt.subplots(figsize=(12, 6))
     max_len = max(len(recs) for _, recs in plot_data)
     label_recs = max(plot_data, key=lambda x: len(x[1]))[1]
     for name, recs in plot_data:
         ax.plot(list(range(len(recs))), [r["xp"] for r in recs], marker="o", linewidth=1.5, markersize=4, label=name)
-
-    # 比較対象が3人以下ならX軸ラベル全部表示。4人以上なら間引き。
-    show_all_xtick_labels = len(plot_data) <= 3
-    set_limited_xticks(ax, list(range(max_len)), [r["time"].strftime("%m/%d %H:%M") for r in label_recs], force_all=show_all_xtick_labels)
-
+    set_limited_xticks(ax, list(range(max_len)), [r["time"].strftime("%m/%d %H:%M") for r in label_recs], force_all=(len(plot_data) <= 3))
     graph_title = "みんなのXP比較グラフ" if is_all_compare else "指定メンバーのXP比較グラフ"
     ax.set_title(f"{graph_title} ({title})", fontsize=15)
     ax.grid(True, linestyle="--", alpha=0.6)
@@ -1358,17 +1228,17 @@ async def comp_graph(interaction: discord.Interaction, 相手1: discord.Member =
 
 
 @client.tree.command(name="ランキング", description="XPランキングを表示します")
-@app_commands.describe(期間="例：「5月」「夏シーズン」「全期間」「全記録」など（空欄で現シーズン表示）")
+@app_commands.describe(期間="例：「5月」「夏シーズン」「全期間」「全記録」など")
 async def ranking(interaction: discord.Interaction, 期間: str = None):
     await interaction.response.defer()
     now = datetime.now(JST)
-    season_year, current_season_type = get_current_season(now)
-    ty, ts, tm, ia, title, is_continuous = parse_args_from_str(期間, season_year, current_season_type, True)
-    all_d = await get_records_for_period(ty, ts, tm, ia, is_continuous)
+    sy, st = get_current_season(now)
+    ty, ts, tm, ia, title, cont = parse_args_from_str(期間, sy, st, True)
+    all_d = await get_records_for_period(ty, ts, tm, ia, cont)
     ranking_list = []
     for uid, info in all_d.items():
         recs = info["records"]
-        if not ia and not is_continuous:
+        if not ia and not cont:
             recs = [r for r in recs if is_record_in_period(r["time"], ty, ts, tm)]
         if recs:
             ranking_list.append((info["name"], recs[-1]["xp"]))
@@ -1396,8 +1266,7 @@ async def award(interaction: discord.Interaction):
         return
     target_year, target_season = get_previous_season_for_award(now)
     all_d = await get_records_for_period(str(target_year), target_season, None, False)
-    most_played = []
-    last_spurt = []
+    most_played, last_spurt = [], []
     for uid, info in all_d.items():
         recs = [r for r in info["records"] if is_record_in_period(r["time"], str(target_year), target_season, None)]
         if not recs:
@@ -1417,11 +1286,7 @@ async def award(interaction: discord.Interaction):
         return
     most_played.sort(key=lambda x: x[1], reverse=True)
     last_spurt.sort(key=lambda x: x[1], reverse=True)
-    await interaction.followup.send(
-        f"🎉 **{target_year}年 {target_season} 表彰式** 🎉\n\n"
-        f"🦑 **一番潜ったで賞**: {most_played[0][0]}さん ({most_played[0][1]}回)\n"
-        f"🔥 **ラストスパート賞**: {last_spurt[0][0]}さん (+{last_spurt[0][1]} XP)"
-    )
+    await interaction.followup.send(f"🎉 **{target_year}年 {target_season} 表彰式** 🎉\n\n🦑 **一番潜ったで賞**: {most_played[0][0]}さん ({most_played[0][1]}回)\n🔥 **ラストスパート賞**: {last_spurt[0][0]}さん (+{last_spurt[0][1]} XP)")
 
 
 @client.tree.command(name="リセット", description="自分の直近1件のXP記録を取り消します")
@@ -1543,9 +1408,7 @@ async def on_message(message):
     if not log_channel:
         await message.channel.send("⚠️ ログチャンネルが見つかりません。")
         return
-
     await ensure_cache()
-
     async with cache_lock:
         all_d = CACHE_BY_USER
         personal_best_xp = max([r["xp"] for r in all_d.get(message.author.id, {"records": []})["records"]], default=None)
@@ -1558,7 +1421,6 @@ async def on_message(message):
         if old_xp is not None and abs(new_xp - old_xp) > 500:
             await message.channel.send(f"⚠️ 今シーズン前回記録({old_xp} XP)から±500以上の急激な増減があるため保存できません！")
             return
-
     splat_time = parse_specified_time(message.content, now)
     is_confident = True
     if not splat_time:
@@ -1566,26 +1428,15 @@ async def on_message(message):
     if not splat_time:
         splat_time = get_last_splat_end_time(now)
         is_confident = False
-
     record_season_year, record_season_type = get_record_season_for_shift_end(splat_time)
     record_season_name = season_full(record_season_year, record_season_type)
     sent = await log_channel.send(make_record_json(message.author.id, message.author.display_name, new_xp, splat_time, record_season_name, message.id))
-
     async with cache_lock:
-        rec = _new_cache_rec({
-            "user_id": message.author.id,
-            "user_name": message.author.display_name,
-            "xp": new_xp,
-            "time": splat_time,
-            "season": record_season_name,
-            "message_id": message.id,
-        }, "log", sent.id)
+        rec = _new_cache_rec({"user_id": message.author.id, "user_name": message.author.display_name, "xp": new_xp, "time": splat_time, "season": record_season_name, "message_id": message.id}, "log", sent.id)
         _cache_add_single(rec)
-
         updated_xps = current_season_xps.copy()
         updated_xps[message.author.id] = (message.author.display_name, new_xp)
-        passed_users = []
-        overtaken_users = []
+        passed_users, overtaken_users = [], []
         for uid, (name, xp) in current_season_xps.items():
             if uid == message.author.id:
                 continue
@@ -1598,7 +1449,6 @@ async def on_message(message):
         active_goal = CACHE_GOALS.get(message.author.id, {}).get(record_season_name)
         if active_goal and not active_goal.get("active", True):
             active_goal = None
-
     goal_msg = ""
     if active_goal:
         target_xp = active_goal["target_xp"]
@@ -1608,7 +1458,6 @@ async def on_message(message):
             remain = target_xp - new_xp
             if remain <= 100:
                 goal_msg += f"\n🎯 目標 **{target_xp} XP** まであと **{remain} XP**！"
-
     drama_msg = ""
     if BOT_SETTINGS.get("drama_enabled", True):
         drama_msg += build_power_change_message(old_xp, new_xp)
@@ -1626,25 +1475,20 @@ async def on_message(message):
         else:
             _, (above_name, above_xp) = sorted_ranking[my_index - 1]
             drama_msg += f"\n🎯 1つ上の{above_name}さんまであと **XP {above_xp - new_xp}**！"
-
     start_time = splat_time - timedelta(hours=2)
     notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
     if not is_confident:
         notice += "\n💡 ※時間が違った場合は、チャットを編集して『17:00』のように終了時間を書き足してください！"
-
     area_msg = ""
     if BOT_SETTINGS.get("area_notice_enabled", True):
         next_area = await get_next_area_shift(now)
         if next_area:
-            ns = next_area["start"]
-            ne = next_area["end"]
+            ns, ne = next_area["start"], next_area["end"]
             stage_text = " / ".join(next_area["stages"]) if next_area["stages"] else "ステージ情報なし"
             area_msg = f"\n\n🗓️ **次のガチエリア**\n**{ns.strftime('%m/%d %H:%M')} - {ne.strftime('%H:%M')}**\n🗺️ ステージ：**{stage_text}**"
         else:
             area_msg = "\n\n🗓️ **次のガチエリア**\n現在、次回エリア情報を取得できませんでした。"
-
     await message.channel.send(f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}{goal_msg}{area_msg}")
-
     success, archived_count, _ = await auto_archive_if_needed(force=False)
     if success and archived_count:
         await message.channel.send(f"📦 条件を満たした過去シーズンログ **{archived_count}件** をシーズン別アーカイブしました！")
@@ -1694,8 +1538,8 @@ async def on_raw_message_edit(payload):
             spec_time = parse_specified_time(content, datetime.now(JST))
             if spec_time:
                 rec["time"] = spec_time
-                season_year, season_type = get_record_season_for_shift_end(spec_time)
-                rec["season"] = season_full(season_year, season_type)
+                sy, st = get_record_season_for_shift_end(spec_time)
+                rec["season"] = season_full(sy, st)
                 CACHE_BY_USER[rec["user_id"]]["records"].sort(key=lambda x: x["time"])
                 if target_channel:
                     start_time = spec_time - timedelta(hours=2)
