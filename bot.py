@@ -42,7 +42,7 @@ if not TOKEN:
 TARGET_CHANNEL_ID = 1474973509217423401
 LOG_CHANNEL_ID = 1508739566138294522
 ARCHIVE_CHANNEL_ID = 1510291838957912285
-ADMIN_USERS = ["poqoppo","ricekei"]
+ADMIN_USERS = ["poqoppo", "ricekei"]
 SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS = {"drama_enabled": True, "area_notice_enabled": True}
 ARCHIVE_THRESHOLD = 4500
@@ -58,12 +58,13 @@ SCHEDULE_CACHE_SECONDS = 600
 archive_lock = asyncio.Lock()
 
 # ===== メモリキャッシュ =====
-# 起動時に一度だけ log + archive を読み込み、以降は記録の追加・編集・削除のたびに差分更新する。
+# 起動時に一度だけ log + archive を読み込み、以降は追加・編集・削除のたびに差分更新します。
+# これにより、XP投稿やランキング表示のたびにDiscord履歴/添付JSONを全読みしなくなります。
 CACHE_READY = False
-CACHE_BY_USER = {}     # uid -> {"name": str, "records": [rec, ...]}（recは時刻順）
-CACHE_BY_SOURCE = {}   # 元メッセージID -> rec（現在ログのレコードのみ。編集/削除で使用）
-CACHE_GOALS = {}       # uid -> {season: goal}
-CACHE_GOAL_MSG = {}    # (uid, season) -> ログ側メッセージID
+CACHE_BY_USER = {}      # uid -> {"name": str, "records": [rec, ...]} recは時刻順
+CACHE_BY_SOURCE = {}    # 元メッセージID -> rec 現在ログのレコードのみ。編集/削除同期用
+CACHE_GOALS = {}        # uid -> {season: goal}
+CACHE_GOAL_MSG = {}     # (uid, season) -> ログ側メッセージID
 cache_lock = asyncio.Lock()
 STARTED_ANNOUNCED = False
 
@@ -489,7 +490,7 @@ def is_record_in_period(record_time, year_str, season_str=None, month_int=None):
     return True
 
 
-# ===== Discord読み込み（キャッシュ再構築・アーカイブ処理で使用） =====
+# ===== Discord読み込み。起動時のキャッシュ再構築・アーカイブ処理だけで使う =====
 async def get_current_log_records_with_messages():
     channel = client.get_channel(LOG_CHANNEL_ID)
     items = []
@@ -529,7 +530,7 @@ async def get_archive_records():
     return records
 
 
-# ===== キャッシュ操作（同期・低レベル。ロックは呼び出し側が取る） =====
+# ===== キャッシュ操作。低レベル関数。ロックは呼び出し側で取る =====
 def _new_cache_rec(parsed, source, log_msg_id):
     uid = parsed["user_id"]
     src_id = int(parsed.get("message_id", 0))
@@ -539,10 +540,10 @@ def _new_cache_rec(parsed, source, log_msg_id):
         "xp": parsed["xp"],
         "time": parsed["time"],
         "season": parsed["season"],
-        "message_id": src_id,
-        "msg_id": src_id,          # 旧 get_all_records 互換のエイリアス
-        "_source": source,         # "log" or "archive"
-        "_log_msg_id": log_msg_id,  # ログ側メッセージID（編集/削除用）
+        "message_id": src_id,       # ユーザーが送った元メッセージID
+        "msg_id": src_id,           # 後方互換用エイリアス
+        "_source": source,          # "log" or "archive"
+        "_log_msg_id": log_msg_id,  # ログチャンネル側メッセージID。編集/削除用
     }
 
 
@@ -615,18 +616,23 @@ def _count_cache_records():
 
 
 async def _do_rebuild():
-    """cache_lock 取得済み前提でキャッシュを全再構築する。"""
+    """cache_lock取得済み前提でキャッシュを全再構築する。"""
     CACHE_BY_USER.clear()
     CACHE_BY_SOURCE.clear()
     CACHE_GOALS.clear()
     CACHE_GOAL_MSG.clear()
+
     seen = set()
+
+    # 先にアーカイブを読む
     for parsed in await get_archive_records():
         key = make_record_unique_key(parsed)
         if key in seen:
             continue
         seen.add(key)
         _cache_insert(_new_cache_rec(parsed, "archive", None))
+
+    # 次に現在ログと目標を読む
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         async for message in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT, oldest_first=True):
@@ -643,6 +649,7 @@ async def _do_rebuild():
             goal = parse_goal_record(message.content)
             if goal:
                 _cache_set_goal(goal, message.id)
+
     for uid in CACHE_BY_USER:
         CACHE_BY_USER[uid]["records"].sort(key=lambda x: x["time"])
 
@@ -711,6 +718,7 @@ async def auto_archive_if_needed(force=False):
             )
         except Exception as e:
             return False, count, f"アーカイブ送信失敗: {e}"
+
         deleted_count = 0
         for msg, _ in items:
             try:
@@ -719,7 +727,8 @@ async def auto_archive_if_needed(force=False):
                 await asyncio.sleep(DELETE_SLEEP_SECONDS)
             except Exception as e:
                 print(f"Archive delete error: {e}")
-        # アーカイブ後はキャッシュを再同期（頻度が低いので全再構築でOK）
+
+        # アーカイブ後はキャッシュを全再構築。頻度が低いので安全優先。
         await rebuild_cache()
         return True, deleted_count, "アーカイブ完了"
 
@@ -1268,6 +1277,7 @@ async def on_message(message):
     if not log_channel:
         await message.channel.send("⚠️ ログチャンネルが見つかりません。")
         return
+
     await ensure_cache()
 
     response = None
@@ -1297,6 +1307,7 @@ async def on_message(message):
             is_confident = False
         record_season_year, record_season_type = get_current_season(splat_time)
         record_season_full_str = f"{record_season_year}年 {record_season_type}"
+
         sent = await log_channel.send(make_record_json(message.author.id, message.author.display_name, new_xp, splat_time, record_season_full_str, message.id))
         rec = _new_cache_rec({
             "user_id": message.author.id,
