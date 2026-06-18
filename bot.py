@@ -1,4 +1,3 @@
-
 import discord
 from discord import app_commands
 import asyncio, io, json, os, random, re, time, urllib.request
@@ -57,6 +56,16 @@ CACHED_AREA_DETAILS = []
 LAST_SCHEDULE_FETCH = None
 SCHEDULE_CACHE_SECONDS = 600
 archive_lock = asyncio.Lock()
+
+# ===== メモリキャッシュ =====
+# 起動時に一度だけ log + archive を読み込み、以降は記録の追加・編集・削除のたびに差分更新する。
+CACHE_READY = False
+CACHE_BY_USER = {}     # uid -> {"name": str, "records": [rec, ...]}（recは時刻順）
+CACHE_BY_SOURCE = {}   # 元メッセージID -> rec（現在ログのレコードのみ。編集/削除で使用）
+CACHE_GOALS = {}       # uid -> {season: goal}
+CACHE_GOAL_MSG = {}    # (uid, season) -> ログ側メッセージID
+cache_lock = asyncio.Lock()
+STARTED_ANNOUNCED = False
 
 
 def load_settings():
@@ -480,6 +489,7 @@ def is_record_in_period(record_time, year_str, season_str=None, month_int=None):
     return True
 
 
+# ===== Discord読み込み（キャッシュ再構築・アーカイブ処理で使用） =====
 async def get_current_log_records_with_messages():
     channel = client.get_channel(LOG_CHANNEL_ID)
     items = []
@@ -519,6 +529,160 @@ async def get_archive_records():
     return records
 
 
+# ===== キャッシュ操作（同期・低レベル。ロックは呼び出し側が取る） =====
+def _new_cache_rec(parsed, source, log_msg_id):
+    uid = parsed["user_id"]
+    src_id = int(parsed.get("message_id", 0))
+    return {
+        "user_id": uid,
+        "user_name": parsed["user_name"],
+        "xp": parsed["xp"],
+        "time": parsed["time"],
+        "season": parsed["season"],
+        "message_id": src_id,
+        "msg_id": src_id,          # 旧 get_all_records 互換のエイリアス
+        "_source": source,         # "log" or "archive"
+        "_log_msg_id": log_msg_id,  # ログ側メッセージID（編集/削除用）
+    }
+
+
+def _cache_insert(rec):
+    uid = rec["user_id"]
+    uname = rec["user_name"]
+    if uid not in CACHE_BY_USER:
+        CACHE_BY_USER[uid] = {"name": uname, "records": []}
+    if uname != f"ID:{uid}":
+        CACHE_BY_USER[uid]["name"] = uname
+    CACHE_BY_USER[uid]["records"].append(rec)
+    if rec["_source"] == "log" and rec["message_id"]:
+        CACHE_BY_SOURCE[rec["message_id"]] = rec
+
+
+def _cache_add_single(rec):
+    _cache_insert(rec)
+    CACHE_BY_USER[rec["user_id"]]["records"].sort(key=lambda x: x["time"])
+
+
+def _cache_remove_record(rec):
+    uid = rec["user_id"]
+    if uid in CACHE_BY_USER:
+        try:
+            CACHE_BY_USER[uid]["records"].remove(rec)
+        except ValueError:
+            pass
+    mid = rec.get("message_id")
+    if mid and CACHE_BY_SOURCE.get(mid) is rec:
+        del CACHE_BY_SOURCE[mid]
+
+
+def _cache_find_latest_log_record(uid):
+    if uid not in CACHE_BY_USER:
+        return None
+    cands = [r for r in CACHE_BY_USER[uid]["records"] if r["_source"] == "log" and r["_log_msg_id"]]
+    if not cands:
+        return None
+    return max(cands, key=lambda r: r["_log_msg_id"])
+
+
+def _cache_user_log_records(uid):
+    if uid not in CACHE_BY_USER:
+        return []
+    return [r for r in CACHE_BY_USER[uid]["records"] if r["_source"] == "log" and r["_log_msg_id"]]
+
+
+def _cache_all_log_records():
+    out = []
+    for uid in CACHE_BY_USER:
+        out.extend(r for r in CACHE_BY_USER[uid]["records"] if r["_source"] == "log" and r["_log_msg_id"])
+    return out
+
+
+def _cache_set_goal(goal, log_msg_id):
+    CACHE_GOALS.setdefault(goal["user_id"], {})[goal["season"]] = goal
+    CACHE_GOAL_MSG[(goal["user_id"], goal["season"])] = log_msg_id
+
+
+def _cache_remove_goal(uid, season):
+    if uid in CACHE_GOALS and season in CACHE_GOALS[uid]:
+        del CACHE_GOALS[uid][season]
+    CACHE_GOAL_MSG.pop((uid, season), None)
+
+
+def _count_cache_records():
+    current = sum(1 for u in CACHE_BY_USER.values() for r in u["records"] if r["_source"] == "log")
+    archived = sum(1 for u in CACHE_BY_USER.values() for r in u["records"] if r["_source"] == "archive")
+    return current, archived
+
+
+async def _do_rebuild():
+    """cache_lock 取得済み前提でキャッシュを全再構築する。"""
+    CACHE_BY_USER.clear()
+    CACHE_BY_SOURCE.clear()
+    CACHE_GOALS.clear()
+    CACHE_GOAL_MSG.clear()
+    seen = set()
+    for parsed in await get_archive_records():
+        key = make_record_unique_key(parsed)
+        if key in seen:
+            continue
+        seen.add(key)
+        _cache_insert(_new_cache_rec(parsed, "archive", None))
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        async for message in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT, oldest_first=True):
+            if message.author != client.user:
+                continue
+            parsed = parse_log_record(message.content, message.created_at)
+            if parsed:
+                key = make_record_unique_key(parsed)
+                if key in seen:
+                    continue
+                seen.add(key)
+                _cache_insert(_new_cache_rec(parsed, "log", message.id))
+                continue
+            goal = parse_goal_record(message.content)
+            if goal:
+                _cache_set_goal(goal, message.id)
+    for uid in CACHE_BY_USER:
+        CACHE_BY_USER[uid]["records"].sort(key=lambda x: x["time"])
+
+
+async def ensure_cache():
+    global CACHE_READY
+    if CACHE_READY:
+        return
+    async with cache_lock:
+        if CACHE_READY:
+            return
+        await _do_rebuild()
+        CACHE_READY = True
+
+
+async def rebuild_cache():
+    global CACHE_READY
+    async with cache_lock:
+        await _do_rebuild()
+        CACHE_READY = True
+
+
+async def get_all_records():
+    await ensure_cache()
+    return CACHE_BY_USER
+
+
+async def get_all_goals():
+    await ensure_cache()
+    return CACHE_GOALS
+
+
+async def get_active_goal(user_id, season):
+    await ensure_cache()
+    goal = CACHE_GOALS.get(user_id, {}).get(season)
+    if not goal or not goal.get("active", True):
+        return None
+    return goal
+
+
 async def auto_archive_if_needed(force=False):
     async with archive_lock:
         archive_channel = client.get_channel(ARCHIVE_CHANNEL_ID)
@@ -555,62 +719,29 @@ async def auto_archive_if_needed(force=False):
                 await asyncio.sleep(DELETE_SLEEP_SECONDS)
             except Exception as e:
                 print(f"Archive delete error: {e}")
+        # アーカイブ後はキャッシュを再同期（頻度が低いので全再構築でOK）
+        await rebuild_cache()
         return True, deleted_count, "アーカイブ完了"
-
-
-async def get_all_records():
-    data = {}
-    seen = set()
-    all_records = []
-    all_records.extend(await get_archive_records())
-    current_items = await get_current_log_records_with_messages()
-    all_records.extend([record for _, record in current_items])
-    for record in all_records:
-        key = make_record_unique_key(record)
-        if key in seen:
-            continue
-        seen.add(key)
-        uid = record["user_id"]
-        uname = record["user_name"]
-        if uid not in data:
-            data[uid] = {"name": uname, "records": []}
-        if uname != f"ID:{uid}":
-            data[uid]["name"] = uname
-        data[uid]["records"].append({
-            "xp": record["xp"],
-            "time": record["time"],
-            "season": record["season"],
-            "msg_id": record["message_id"],
-        })
-    for uid in data:
-        data[uid]["records"].sort(key=lambda x: x["time"])
-    return data
-
-
-async def get_all_goals():
-    channel = client.get_channel(LOG_CHANNEL_ID)
-    goals = {}
-    if not channel:
-        return goals
-    async for message in channel.history(limit=ARCHIVE_HISTORY_LIMIT, oldest_first=True):
-        if message.author != client.user:
-            continue
-        goal = parse_goal_record(message.content)
-        if goal:
-            goals.setdefault(goal["user_id"], {})[goal["season"]] = goal
-    return goals
-
-
-async def get_active_goal(user_id, season):
-    goal = (await get_all_goals()).get(user_id, {}).get(season)
-    if not goal or not goal.get("active", True):
-        return None
-    return goal
 
 
 @client.event
 async def on_ready():
+    global STARTED_ANNOUNCED
     print(f"{client.user} が起動しました！")
+    await ensure_cache()
+    print("キャッシュ初期化完了")
+    if not STARTED_ANNOUNCED:
+        STARTED_ANNOUNCED = True
+        current, archived = _count_cache_records()
+        ch = client.get_channel(TARGET_CHANNEL_ID)
+        if ch:
+            try:
+                await ch.send(
+                    f"✅ **起動完了！** ログ **{current}件** ・アーカイブ **{archived}件** を読み込みました。\n"
+                    f"パワーの記録を受け付けます！"
+                )
+            except Exception as e:
+                print(f"Startup message error: {e}")
 
 
 @client.tree.command(name="通知設定", description="煽り文章・次のガチエリア表示をON/OFFします")
@@ -649,14 +780,28 @@ async def show_settings(interaction: discord.Interaction):
 @client.tree.command(name="ログ件数", description="現在ログとアーカイブ済みログの件数を確認します")
 async def log_count(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    current_items = await get_current_log_records_with_messages()
-    archive_records = await get_archive_records()
+    await ensure_cache()
+    current, archived = _count_cache_records()
     await interaction.followup.send(
         f"📊 **XPログ件数**\n"
-        f"現在ログチャンネル：**{len(current_items)}件**\n"
-        f"アーカイブ済み：**{len(archive_records)}件**\n"
-        f"合計：**{len(current_items) + len(archive_records)}件**\n"
+        f"現在ログチャンネル：**{current}件**\n"
+        f"アーカイブ済み：**{archived}件**\n"
+        f"合計：**{current + archived}件**\n"
         f"自動アーカイブしきい値：**{ARCHIVE_THRESHOLD}件**"
+    )
+
+
+@client.tree.command(name="再読み込み", description="【管理者専用】キャッシュを作り直します（ログを手動編集した後など）")
+async def reload_cache(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin(interaction.user):
+        await interaction.followup.send("⚠️ このコマンドは管理者専用です。")
+        return
+    await rebuild_cache()
+    current, archived = _count_cache_records()
+    await interaction.followup.send(
+        f"🔄 キャッシュを再読み込みしました。\n"
+        f"ログ **{current}件** ・アーカイブ **{archived}件**"
     )
 
 
@@ -691,20 +836,32 @@ async def set_goal(interaction: discord.Interaction, 目標xp: int):
     if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
         return
-    async for m_log in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        goal = parse_goal_record(m_log.content)
-        if goal and goal["user_id"] == interaction.user.id and goal["season"] == season_full and goal.get("active", True):
-            goal["active"] = False
-            await m_log.edit(content=goal_to_log_content(goal))
-    await log_channel.send(make_goal_json(interaction.user.id, interaction.user.display_name, 目標xp, season_full))
-    all_d = await get_all_records()
+    await ensure_cache()
     current_xp = None
-    if interaction.user.id in all_d:
-        recs = [r for r in all_d[interaction.user.id]["records"] if is_record_in_period(r["time"], str(season_year), season_type, None)]
-        if recs:
-            current_xp = recs[-1]["xp"]
+    async with cache_lock:
+        old_goal = CACHE_GOALS.get(interaction.user.id, {}).get(season_full)
+        old_msg_id = CACHE_GOAL_MSG.get((interaction.user.id, season_full))
+        if old_goal and old_goal.get("active", True) and old_msg_id:
+            old_goal["active"] = False
+            try:
+                await log_channel.get_partial_message(old_msg_id).edit(content=goal_to_log_content(old_goal))
+            except Exception:
+                pass
+        sent = await log_channel.send(make_goal_json(interaction.user.id, interaction.user.display_name, 目標xp, season_full))
+        new_goal = {
+            "user_id": interaction.user.id,
+            "user_name": interaction.user.display_name,
+            "target_xp": 目標xp,
+            "season": season_full,
+            "created_at": now.strftime("%Y/%m/%d %H:%M"),
+            "active": True,
+        }
+        _cache_set_goal(new_goal, sent.id)
+        info = CACHE_BY_USER.get(interaction.user.id)
+        if info:
+            recs = [r for r in info["records"] if is_record_in_period(r["time"], str(season_year), season_type, None)]
+            if recs:
+                current_xp = recs[-1]["xp"]
     if current_xp is None:
         await interaction.followup.send(f"🎯 **{season_full} の目標を設定しました！**\n目標：**{目標xp} XP**\nまだ今シーズンの記録がないので、まずは1回記録しましょう！")
         return
@@ -764,15 +921,18 @@ async def delete_goal(interaction: discord.Interaction, 確認: str):
     if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
         return
+    await ensure_cache()
     deleted = False
-    async for m_log in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        goal = parse_goal_record(m_log.content)
-        if goal and goal["user_id"] == interaction.user.id and goal["season"] == season_full and goal.get("active", True):
-            await m_log.delete()
+    async with cache_lock:
+        msg_id = CACHE_GOAL_MSG.get((interaction.user.id, season_full))
+        goal = CACHE_GOALS.get(interaction.user.id, {}).get(season_full)
+        if msg_id and goal and goal.get("active", True):
+            try:
+                await log_channel.get_partial_message(msg_id).delete()
+            except Exception:
+                pass
+            _cache_remove_goal(interaction.user.id, season_full)
             deleted = True
-            break
     if deleted:
         await interaction.followup.send(f"🗑️ **{season_full}** の目標を削除しました。")
     else:
@@ -992,19 +1152,21 @@ async def award(interaction: discord.Interaction):
 @client.tree.command(name="リセット", description="自分の直近1件のXP記録を取り消します")
 async def reset_last(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    channel = client.get_channel(LOG_CHANNEL_ID)
-    if not channel:
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
         return
+    await ensure_cache()
     deleted = False
-    async for m_log in channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        record = parse_log_record(m_log.content, m_log.created_at)
-        if record and record["user_id"] == interaction.user.id:
-            await m_log.delete()
+    async with cache_lock:
+        rec = _cache_find_latest_log_record(interaction.user.id)
+        if rec:
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
+            except Exception:
+                pass
+            _cache_remove_record(rec)
             deleted = True
-            break
     await interaction.followup.send("🗑️ 直近の未アーカイブ記録を1件リセットしました！" if deleted else "⚠️ 削除対象がありません。すでにアーカイブ済みの記録はこのコマンドでは消せません。")
 
 
@@ -1015,19 +1177,21 @@ async def delete_my_data(interaction: discord.Interaction, 確認: str):
     if 確認 != "DELETE":
         await interaction.followup.send("⚠️ 確認文字列が違います。削除するには `DELETE` と入力してください。")
         return
-    channel = client.get_channel(LOG_CHANNEL_ID)
-    if not channel:
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
         return
+    await ensure_cache()
     deleted_count = 0
-    async for m_log in channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        record = parse_log_record(m_log.content, m_log.created_at)
-        if record and record["user_id"] == interaction.user.id:
-            await m_log.delete()
-            deleted_count += 1
-            await asyncio.sleep(DELETE_SLEEP_SECONDS)
+    async with cache_lock:
+        for rec in list(_cache_user_log_records(interaction.user.id)):
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
+                deleted_count += 1
+                _cache_remove_record(rec)
+                await asyncio.sleep(DELETE_SLEEP_SECONDS)
+            except Exception:
+                pass
     await interaction.followup.send(f"✅ あなたの未アーカイブデータ {deleted_count} 件を消去しました！\n※アーカイブ済みファイル内の過去データは削除されません。")
 
 
@@ -1041,19 +1205,21 @@ async def delete_member_data(interaction: discord.Interaction, 対象: discord.M
     if 確認 != "RESET":
         await interaction.followup.send("⚠️ 確認文字列が違います。削除するには `RESET` と入力してください。")
         return
-    channel = client.get_channel(LOG_CHANNEL_ID)
-    if not channel:
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
         return
+    await ensure_cache()
     deleted_count = 0
-    async for m_log in channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        record = parse_log_record(m_log.content, m_log.created_at)
-        if record and record["user_id"] == 対象.id:
-            await m_log.delete()
-            deleted_count += 1
-            await asyncio.sleep(DELETE_SLEEP_SECONDS)
+    async with cache_lock:
+        for rec in list(_cache_user_log_records(対象.id)):
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
+                deleted_count += 1
+                _cache_remove_record(rec)
+                await asyncio.sleep(DELETE_SLEEP_SECONDS)
+            except Exception:
+                pass
     await interaction.followup.send(f"🚨 管理者権限：{対象.display_name}さんの未アーカイブデータ {deleted_count} 件を削除しました！\n※アーカイブ済みファイル内の過去データは削除されません。")
 
 
@@ -1067,18 +1233,21 @@ async def reset_all_data(interaction: discord.Interaction, 確認: str):
     if 確認 != "RESET":
         await interaction.followup.send("⚠️ 確認文字列が違います。全削除するには `RESET` と入力してください。")
         return
-    channel = client.get_channel(LOG_CHANNEL_ID)
-    if not channel:
+    log_channel = client.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
         await interaction.followup.send("⚠️ ログチャンネルが見つかりません。")
         return
+    await ensure_cache()
     deleted_count = 0
-    async for m_log in channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author == client.user:
-            record = parse_log_record(m_log.content, m_log.created_at)
-            if record:
-                await m_log.delete()
+    async with cache_lock:
+        for rec in list(_cache_all_log_records()):
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
                 deleted_count += 1
+                _cache_remove_record(rec)
                 await asyncio.sleep(DELETE_SLEEP_SECONDS)
+            except Exception:
+                pass
     await interaction.followup.send(f"🚨 管理者権限：未アーカイブXPデータ（計 {deleted_count} 件）を初期化しました！\n※アーカイブ済みファイル内の過去データは削除されません。")
 
 
@@ -1095,140 +1264,158 @@ async def on_message(message):
     if not (500 <= new_xp < 5000):
         await message.channel.send("⚠️ パワーは500〜5000で入力してください！")
         return
-    all_d = await get_all_records()
-    personal_best_xp = max([r["xp"] for r in all_d.get(message.author.id, {}).get("records", [])], default=None)
-    current_season_xps = {}
-    for uid, info in all_d.items():
-        recs = [r for r in info["records"] if is_record_in_period(r["time"], str(season_year), current_season_type, None)]
-        if recs:
-            current_season_xps[uid] = (info["name"], recs[-1]["xp"])
-    old_xp = current_season_xps.get(message.author.id, (message.author.display_name, None))[1]
-
-    # 重要：シーズン最初の入力は、前シーズンのXPと比較しません。
-    # 同じシーズン内に既に記録がある場合だけ、±500チェックを行います。
-    if old_xp is not None:
-        if abs(new_xp - old_xp) > 500:
-            await message.channel.send(f"⚠️ 今シーズン前回記録({old_xp} XP)から±500以上の急激な増減があるため保存できません！")
-            return
-
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if not log_channel:
         await message.channel.send("⚠️ ログチャンネルが見つかりません。")
         return
-    splat_time = parse_specified_time(message.content, now)
-    is_confident = True
-    if not splat_time:
-        splat_time = await update_and_get_last_area_time(now)
-    if not splat_time:
-        splat_time = get_last_splat_end_time(now)
-        is_confident = False
-    record_season_year, record_season_type = get_current_season(splat_time)
-    record_season_full_str = f"{record_season_year}年 {record_season_type}"
-    await log_channel.send(make_record_json(message.author.id, message.author.display_name, new_xp, splat_time, record_season_full_str, message.id))
-    updated_xps = current_season_xps.copy()
-    updated_xps[message.author.id] = (message.author.display_name, new_xp)
-    passed_users = []
-    overtaken_users = []
-    for uid, (name, xp) in current_season_xps.items():
-        if uid == message.author.id:
-            continue
-        if (old_xp is not None and xp >= old_xp and new_xp > xp) or (old_xp is None and new_xp > xp):
-            passed_users.append(name)
-        if old_xp is not None and xp < old_xp and new_xp < xp:
-            overtaken_users.append(name)
-    sorted_ranking = sorted(updated_xps.items(), key=lambda x: x[1][1], reverse=True)
-    my_index = next((i for i, (uid, _) in enumerate(sorted_ranking) if uid == message.author.id), 0)
-    goal_msg = ""
-    active_goal = await get_active_goal(message.author.id, record_season_full_str)
-    if active_goal:
-        target_xp = active_goal["target_xp"]
-        if new_xp >= target_xp and (old_xp is None or old_xp < target_xp):
-            goal_msg += random.choice([
-                f"\n🎯 **目標達成！** 目標 **{target_xp} XP** を突破！言い訳なしで強いです。",
-                f"\n🏁 **ゴール到達！** **{target_xp} XP** 達成！次はもっと高い壁、置きましょう。",
-                f"\n🔥 **目標粉砕！** **{target_xp} XP** を超えました。目標、もう過去のものです。",
-                f"\n👑 **目標クリア！** **{target_xp} XP** 到達！これはちゃんと祝っていいやつ。",
-            ])
-        elif new_xp < target_xp:
-            remain = target_xp - new_xp
-            if remain <= 30:
+    await ensure_cache()
+
+    response = None
+    async with cache_lock:
+        all_d = CACHE_BY_USER
+        personal_best_xp = max([r["xp"] for r in all_d.get(message.author.id, {"records": []})["records"]], default=None)
+        current_season_xps = {}
+        for uid, info in all_d.items():
+            recs = [r for r in info["records"] if is_record_in_period(r["time"], str(season_year), current_season_type, None)]
+            if recs:
+                current_season_xps[uid] = (info["name"], recs[-1]["xp"])
+        old_xp = current_season_xps.get(message.author.id, (message.author.display_name, None))[1]
+
+        # 重要：シーズン最初の入力は、前シーズンのXPと比較しません。
+        # 同じシーズン内に既に記録がある場合だけ、±500チェックを行います。
+        if old_xp is not None:
+            if abs(new_xp - old_xp) > 500:
+                await message.channel.send(f"⚠️ 今シーズン前回記録({old_xp} XP)から±500以上の急激な増減があるため保存できません！")
+                return
+
+        splat_time = parse_specified_time(message.content, now)
+        is_confident = True
+        if not splat_time:
+            splat_time = await update_and_get_last_area_time(now)
+        if not splat_time:
+            splat_time = get_last_splat_end_time(now)
+            is_confident = False
+        record_season_year, record_season_type = get_current_season(splat_time)
+        record_season_full_str = f"{record_season_year}年 {record_season_type}"
+        sent = await log_channel.send(make_record_json(message.author.id, message.author.display_name, new_xp, splat_time, record_season_full_str, message.id))
+        rec = _new_cache_rec({
+            "user_id": message.author.id,
+            "user_name": message.author.display_name,
+            "xp": new_xp,
+            "time": splat_time,
+            "season": record_season_full_str,
+            "message_id": message.id,
+        }, "log", sent.id)
+        _cache_add_single(rec)
+
+        updated_xps = current_season_xps.copy()
+        updated_xps[message.author.id] = (message.author.display_name, new_xp)
+        passed_users = []
+        overtaken_users = []
+        for uid, (name, xp) in current_season_xps.items():
+            if uid == message.author.id:
+                continue
+            if (old_xp is not None and xp >= old_xp and new_xp > xp) or (old_xp is None and new_xp > xp):
+                passed_users.append(name)
+            if old_xp is not None and xp < old_xp and new_xp < xp:
+                overtaken_users.append(name)
+        sorted_ranking = sorted(updated_xps.items(), key=lambda x: x[1][1], reverse=True)
+        my_index = next((i for i, (uid, _) in enumerate(sorted_ranking) if uid == message.author.id), 0)
+        goal_msg = ""
+        active_goal = CACHE_GOALS.get(message.author.id, {}).get(record_season_full_str)
+        if active_goal and not active_goal.get("active", True):
+            active_goal = None
+        if active_goal:
+            target_xp = active_goal["target_xp"]
+            if new_xp >= target_xp and (old_xp is None or old_xp < target_xp):
                 goal_msg += random.choice([
-                    f"\n🎯 目標 **{target_xp} XP** まであと **{remain} XP**！もう目の前、逃げるな。",
-                    f"\n👀 目標まであと **{remain} XP**。ここまで来たら達成するしかないです。",
-                    f"\n🔥 あと **{remain} XP** で目標到達！次の1勝で決めに行きましょう。",
+                    f"\n🎯 **目標達成！** 目標 **{target_xp} XP** を突破！言い訳なしで強いです。",
+                    f"\n🏁 **ゴール到達！** **{target_xp} XP** 達成！次はもっと高い壁、置きましょう。",
+                    f"\n🔥 **目標粉砕！** **{target_xp} XP** を超えました。目標、もう過去のものです。",
+                    f"\n👑 **目標クリア！** **{target_xp} XP** 到達！これはちゃんと祝っていいやつ。",
                 ])
-            elif remain <= 100:
-                goal_msg += random.choice([
-                    f"\n📍 目標 **{target_xp} XP** まであと **{remain} XP**。射程圏内です。",
-                    f"\n🧗 目標まであと **{remain} XP**。登れる壁です、サボらなければ。",
-                    f"\n🚀 あと **{remain} XP**。そろそろ本気出す時間です。",
-                ])
-    drama_msg = ""
-    if BOT_SETTINGS.get("drama_enabled", True):
-        drama_msg += build_power_change_message(old_xp, new_xp)
-        if personal_best_xp is None or new_xp > personal_best_xp:
-            drama_msg += random.choice([
-                f"\n🏅 **自己ベスト更新！** {new_xp} XP！これは胸張っていいやつ！",
-                f"\n🌟 **最高到達点更新！** {new_xp} XP！今のあなたが過去最強です。",
-                f"\n👑 **PB更新！** {new_xp} XP！過去の自分、置いてきました。",
-                f"\n🚀 **自己最高パワー！** {new_xp} XP！今日は祝っていい日です。",
-            ])
-        if passed_users:
-            names_str = "、".join(passed_users)
-            drama_msg += random.choice([
-                f"\n⚔️ **【下剋上】** {names_str}さんをブチ抜きました！後ろに気をつけてくださいね〜？😜",
-                f"\n🔥 **【ジャイアントキリング】** {names_str}さんを抜き去りました！ナイス精神攻撃！",
-                f"\n🦈 **【捕食完了】** {names_str}さんを飲み込みました。ランキングの海は弱肉強食です。",
-                f"\n🚗 **【追い越し成功】** {names_str}さんを華麗にパス！ウインカー出す暇もなかった。",
-            ])
-        elif overtaken_users:
-            names_str = "、".join(overtaken_users)
-            drama_msg += random.choice([
-                f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？さっさと取り返しましょう！💥",
-                f"\n📉 **【煽り運転感知】** {names_str}さんにスマートにパスされました。悔しさをバネに次、潜りましょう！",
-                f"\n🫥 **【順位、消失】** {names_str}さんに前へ行かれました。置いてかれてます、走ってください。",
-            ])
-        if my_index == 0:
-            drama_msg += random.choice([
-                "\n👑 **現在トップ独走中！** このまま連勝して逃げ切りましょう！",
-                "\n🦑 **王座防衛中！** 今のところ追う側じゃなく追われる側です。",
-                "\n🏰 **首位キープ！** 城、建ってます。あとは防衛するだけ。",
-            ])
-            if len(sorted_ranking) > 1:
-                _, (next_name, next_xp) = sorted_ranking[1]
-                drama_msg += f"（2位の{next_name}さんとは **XP {new_xp - next_xp}** 差）"
-        else:
-            _, (above_name, above_xp) = sorted_ranking[my_index - 1]
-            diff_above = above_xp - new_xp
-            if diff_above == 0:
-                drama_msg += f"\n🔥 1つ上の{above_name}さんと **完全にXPが並びました！** 次の1勝で一気に引き離そう！"
-            elif diff_above <= 30:
+            elif new_xp < target_xp:
+                remain = target_xp - new_xp
+                if remain <= 30:
+                    goal_msg += random.choice([
+                        f"\n🎯 目標 **{target_xp} XP** まであと **{remain} XP**！もう目の前、逃げるな。",
+                        f"\n👀 目標まであと **{remain} XP**。ここまで来たら達成するしかないです。",
+                        f"\n🔥 あと **{remain} XP** で目標到達！次の1勝で決めに行きましょう。",
+                    ])
+                elif remain <= 100:
+                    goal_msg += random.choice([
+                        f"\n📍 目標 **{target_xp} XP** まであと **{remain} XP**。射程圏内です。",
+                        f"\n🧗 目標まであと **{remain} XP**。登れる壁です、サボらなければ。",
+                        f"\n🚀 あと **{remain} XP**。そろそろ本気出す時間です。",
+                    ])
+        drama_msg = ""
+        if BOT_SETTINGS.get("drama_enabled", True):
+            drama_msg += build_power_change_message(old_xp, new_xp)
+            if personal_best_xp is None or new_xp > personal_best_xp:
                 drama_msg += random.choice([
-                    f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
-                    f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！",
-                    f"\n🐺 {above_name}さんまであと **XP {diff_above}**！獲物、見えてます。",
+                    f"\n🏅 **自己ベスト更新！** {new_xp} XP！これは胸張っていいやつ！",
+                    f"\n🌟 **最高到達点更新！** {new_xp} XP！今のあなたが過去最強です。",
+                    f"\n👑 **PB更新！** {new_xp} XP！過去の自分、置いてきました。",
+                    f"\n🚀 **自己最高パワー！** {new_xp} XP！今日は祝っていい日です。",
                 ])
+            if passed_users:
+                names_str = "、".join(passed_users)
+                drama_msg += random.choice([
+                    f"\n⚔️ **【下剋上】** {names_str}さんをブチ抜きました！後ろに気をつけてくださいね〜？😜",
+                    f"\n🔥 **【ジャイアントキリング】** {names_str}さんを抜き去りました！ナイス精神攻撃！",
+                    f"\n🦈 **【捕食完了】** {names_str}さんを飲み込みました。ランキングの海は弱肉強食です。",
+                    f"\n🚗 **【追い越し成功】** {names_str}さんを華麗にパス！ウインカー出す暇もなかった。",
+                ])
+            elif overtaken_users:
+                names_str = "、".join(overtaken_users)
+                drama_msg += random.choice([
+                    f"\n😱 **【悲報】** {names_str}さんに抜かされてしまいました…悔しくないんか！？さっさと取り返しましょう！💥",
+                    f"\n📉 **【煽り運転感知】** {names_str}さんにスマートにパスされました。悔しさをバネに次、潜りましょう！",
+                    f"\n🫥 **【順位、消失】** {names_str}さんに前へ行かれました。置いてかれてます、走ってください。",
+                ])
+            if my_index == 0:
+                drama_msg += random.choice([
+                    "\n👑 **現在トップ独走中！** このまま連勝して逃げ切りましょう！",
+                    "\n🦑 **王座防衛中！** 今のところ追う側じゃなく追われる側です。",
+                    "\n🏰 **首位キープ！** 城、建ってます。あとは防衛するだけ。",
+                ])
+                if len(sorted_ranking) > 1:
+                    _, (next_name, next_xp) = sorted_ranking[1]
+                    drama_msg += f"（2位の{next_name}さんとは **XP {new_xp - next_xp}** 差）"
             else:
-                drama_msg += random.choice([
-                    f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！",
-                    f"\n🧗 {above_name}さんまで **XP {diff_above}**。壁はあるけど、登れない高さじゃない。",
-                    f"\n📡 {above_name}さんまで **XP {diff_above}**。まだ遠いけど、レーダーには映ってます。",
-                ])
-    start_time = splat_time - timedelta(hours=2)
-    notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
-    if not is_confident:
-        notice += "\n💡 ※時間が違った場合は、チャットを編集して『17:00』のように終了時間を書き足してください！"
-    area_msg = ""
-    if BOT_SETTINGS.get("area_notice_enabled", True):
-        next_area = await get_next_area_shift(now)
-        if next_area:
-            ns = next_area["start"]
-            ne = next_area["end"]
-            stage_text = " / ".join(next_area["stages"]) if next_area["stages"] else "ステージ情報なし"
-            area_msg = f"\n\n🗓️ **次のガチエリア**\n**{ns.strftime('%m/%d %H:%M')} - {ne.strftime('%H:%M')}**\n🗺️ ステージ：**{stage_text}**"
-        else:
-            area_msg = "\n\n🗓️ **次のガチエリア**\n現在、次回エリア情報を取得できませんでした。"
-    await message.channel.send(f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}{goal_msg}{area_msg}")
+                _, (above_name, above_xp) = sorted_ranking[my_index - 1]
+                diff_above = above_xp - new_xp
+                if diff_above == 0:
+                    drama_msg += f"\n🔥 1つ上の{above_name}さんと **完全にXPが並びました！** 次の1勝で一気に引き離そう！"
+                elif diff_above <= 30:
+                    drama_msg += random.choice([
+                        f"\n🎯 {above_name}さんまであと **XP {diff_above}**！背中が見えたぞ、突撃ーー！🚀",
+                        f"\n✨ {above_name}さんまであと **XP {diff_above}**！もう完全に射程圏内です！",
+                        f"\n🐺 {above_name}さんまであと **XP {diff_above}**！獲物、見えてます。",
+                    ])
+                else:
+                    drama_msg += random.choice([
+                        f"\n🎯 1つ上の{above_name}さんまであと **XP {diff_above}**！一歩ずつ距離を詰めよう！",
+                        f"\n🧗 {above_name}さんまで **XP {diff_above}**。壁はあるけど、登れない高さじゃない。",
+                        f"\n📡 {above_name}さんまで **XP {diff_above}**。まだ遠いけど、レーダーには映ってます。",
+                    ])
+        start_time = splat_time - timedelta(hours=2)
+        notice = f"（記録枠：{start_time.strftime('%m/%d %H:%M')}-{splat_time.strftime('%H:%M')}）"
+        if not is_confident:
+            notice += "\n💡 ※時間が違った場合は、チャットを編集して『17:00』のように終了時間を書き足してください！"
+        area_msg = ""
+        if BOT_SETTINGS.get("area_notice_enabled", True):
+            next_area = await get_next_area_shift(now)
+            if next_area:
+                ns = next_area["start"]
+                ne = next_area["end"]
+                stage_text = " / ".join(next_area["stages"]) if next_area["stages"] else "ステージ情報なし"
+                area_msg = f"\n\n🗓️ **次のガチエリア**\n**{ns.strftime('%m/%d %H:%M')} - {ne.strftime('%H:%M')}**\n🗺️ ステージ：**{stage_text}**"
+            else:
+                area_msg = "\n\n🗓️ **次のガチエリア**\n現在、次回エリア情報を取得できませんでした。"
+        response = f"✅ {new_xp} XP を保存しました！{notice}{drama_msg}{goal_msg}{area_msg}"
+
+    await message.channel.send(response)
     success, archived_count, archive_msg = await auto_archive_if_needed(force=False)
     if success:
         await message.channel.send(f"📦 XPログが多くなったため、**{archived_count}件** を自動アーカイブしました！")
@@ -1241,13 +1428,16 @@ async def on_raw_message_delete(payload):
     log_channel = client.get_channel(LOG_CHANNEL_ID)
     if not log_channel:
         return
-    async for m_log in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        record = parse_log_record(m_log.content, m_log.created_at)
-        if record and record["message_id"] == payload.message_id:
-            await m_log.delete()
-            break
+    await ensure_cache()
+    async with cache_lock:
+        rec = CACHE_BY_SOURCE.get(payload.message_id)
+        if not rec:
+            return
+        try:
+            await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
+        except Exception:
+            pass
+        _cache_remove_record(rec)
 
 
 @client.event
@@ -1260,31 +1450,37 @@ async def on_raw_message_edit(payload):
     if not log_channel or not content:
         return
     match = re.search(r"xp\s*([0-9]+)|([0-9]+)\s*xp", content, re.IGNORECASE)
-    async for m_log in log_channel.history(limit=ARCHIVE_HISTORY_LIMIT):
-        if m_log.author != client.user:
-            continue
-        record = parse_log_record(m_log.content, m_log.created_at)
-        if not record or record["message_id"] != payload.message_id:
-            continue
+    await ensure_cache()
+    async with cache_lock:
+        rec = CACHE_BY_SOURCE.get(payload.message_id)
+        if not rec:
+            return
         if match:
             new_xp = int(match.group(1) or match.group(2))
             if not (500 <= new_xp < 5000):
                 if target_channel:
                     await target_channel.send("⚠️ 編集後のパワーも500〜5000で入力してください！")
                 return
-            record["xp"] = new_xp
-            spec_time = parse_specified_time(content, record["time"])
+            rec["xp"] = new_xp
+            spec_time = parse_specified_time(content, rec["time"])
             if spec_time:
-                record["time"] = spec_time
+                rec["time"] = spec_time
                 season_year, season_type = get_current_season(spec_time)
-                record["season"] = f"{season_year}年 {season_type}"
+                rec["season"] = f"{season_year}年 {season_type}"
+                CACHE_BY_USER[rec["user_id"]]["records"].sort(key=lambda x: x["time"])
                 if target_channel:
                     start_time = spec_time - timedelta(hours=2)
                     await target_channel.send(f"🔄 記録枠を **{start_time.strftime('%H:%M')}ー{spec_time.strftime('%H:%M')}** に変更しました！")
-            await m_log.edit(content=record_to_log_content(record))
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).edit(content=record_to_log_content(rec))
+            except Exception:
+                pass
         else:
-            await m_log.delete()
-        break
+            try:
+                await log_channel.get_partial_message(rec["_log_msg_id"]).delete()
+            except Exception:
+                pass
+            _cache_remove_record(rec)
 
 
 client.run(TOKEN)
