@@ -3826,6 +3826,61 @@ async def on_app_command_error(
 # Main
 # ============================================================
 
+async def run_bot_with_safe_backoff():
+    """
+    Render/Discord側の一時的なHTTP/Cloudflare制限でプロセスを即終了させず、
+    長いバックオフを使って再接続する。
+
+    Cloudflare 1015は短時間に再試行するほど状況を悪化させ得るため、
+    数秒間隔の再起動ループを避ける。
+    """
+    backoff = 300
+    max_backoff = 1800
+
+    while True:
+        try:
+            print("[BOT] Discordへ接続を開始します。")
+            await client.start(TOKEN, reconnect=True)
+            print("[BOT] Discord接続が正常終了しました。")
+            return
+
+        except discord.LoginFailure as e:
+            print(f"[BOT] Discordログイン失敗: {e!r}")
+            print("[BOT] DISCORD_TOKENを確認してください。再試行を停止します。")
+            return
+
+        except discord.HTTPException as e:
+            status = getattr(e, "status", None)
+            print(f"[BOT] Discord HTTPエラー status={status}: {e!r}")
+            print(f"[BOT] {backoff}秒待ってから再接続します。")
+            try:
+                await client.close()
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+        except (OSError, asyncio.TimeoutError) as e:
+            print(f"[BOT] ネットワーク接続エラー: {e!r}")
+            print(f"[BOT] {backoff}秒待ってから再接続します。")
+            try:
+                await client.close()
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+        except Exception as e:
+            print(f"[BOT] 予期しない例外: {type(e).__name__}: {e!r}")
+            print(f"[BOT] {backoff}秒待ってから再接続します。")
+            try:
+                await client.close()
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+
 if __name__ == "__main__":
     ensure_data_dirs()
-    client.run(TOKEN)
+    asyncio.run(run_bot_with_safe_backoff())
